@@ -3,8 +3,10 @@
 //! A target-agnostic P4-16 language server.
 
 pub mod analysis;
+pub mod assists;
 pub mod config;
 pub mod diag;
+pub mod headers;
 pub mod lexer;
 pub mod preprocess;
 pub mod sema;

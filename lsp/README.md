@@ -8,8 +8,10 @@ Features:
 - Diagnostics while typing: lexer, preprocessor (missing includes,
   `#error`, unbalanced conditionals), syntax errors with recovery, and name
   resolution (unknown names, states, match kinds, and struct/header
-  members; duplicate declarations). Code skipped by `#if`/`#ifdef` is
-  reported as faded "unnecessary" hints.
+  members; duplicate declarations; actions a table uses as its default or
+  in entries but does not list in `actions`). Code skipped by
+  `#if`/`#ifdef`, and unused local declarations in controls, parsers,
+  actions, and functions, are reported as faded "unnecessary" hints.
 - Go to definition, declaration, and type definition, including through
   `#include` paths and macro names. A fragment included in several places
   offers each declaration it resolves to.
@@ -17,10 +19,26 @@ Features:
   comment above it, or the one trailing it on the same line).
 - Find references, document highlight (with writes marked), and rename.
 - Completion of members after `.` and of names in scope, with keywords and
-  macros.
+  macros. Names declared in headers the program does not include yet are
+  offered too; accepting one adds the `#include` (auto-import).
 - Signature help for actions, functions, extern methods and constructors,
   and parser/control `apply`, listing every overload.
 - Document symbols (nested) and workspace symbols.
+- Code actions (Helix: `space a`):
+  - Quick fixes: change a misspelled name, member, state, or match kind to
+    a similar one in scope; create a missing action (parameters guessed from
+    the call) or parser state; add the `#include` for a header that
+    declares an unknown name; insert a missing `;`; add an action to a
+    table's `actions`; remove an unused declaration.
+  - Generate: the missing cases of a `switch (t.apply().action_run)`;
+    `emit` calls in a deparser for each header field; parser states for
+    headers that are never extracted.
+  - Rewrite: replace an integer literal with an existing constant of the
+    same value; inline a macro use.
+
+Header candidates for auto-import and the include quick fix come from the
+include directories. Headers in the directories the program already
+includes from come first, so a Tofino program is offered Tofino headers.
 
 The frontend is independent of x4c's code generator and of any target.
 Architecture headers such as `core.p4`, `v1model.p4`, `tna.p4`, and
@@ -105,7 +123,8 @@ include directories.
 
 One setting is read only from the editor: `inactive-regions = false` stops
 reporting code skipped by the preprocessor (which Helix shows dimmed, but
-also lists among the diagnostics).
+also lists among the diagnostics). Unused-declaration hints are not
+affected.
 
 ## Helix
 

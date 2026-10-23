@@ -22,6 +22,9 @@ pub struct Diagnostic {
     pub related: Vec<(Span, String)>,
     /// Marks code that is unused or inactive so editors can fade it.
     pub unnecessary: bool,
+    /// A stable identifier for the kind of problem, such as `unused` or
+    /// `inactive`, shown by editors and used to match quick fixes.
+    pub code: Option<&'static str>,
 }
 
 impl Diagnostic {
@@ -44,6 +47,7 @@ impl Diagnostic {
             message: message.into(),
             related: Vec::new(),
             unnecessary: false,
+            code: None,
         }
     }
 
@@ -53,6 +57,11 @@ impl Diagnostic {
         message: impl Into<String>,
     ) -> Self {
         self.related.push((span, message.into()));
+        self
+    }
+
+    pub fn with_code(mut self, code: &'static str) -> Self {
+        self.code = Some(code);
         self
     }
 }

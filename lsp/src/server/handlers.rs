@@ -288,6 +288,16 @@ impl Server<'_> {
             // scopes first) when the client sorts by `sortText`.
             .map(|(i, c)| CompletionItem {
                 sort_text: Some(format!("{i:05}")),
+                additional_text_edits: (!c.additional_edits.is_empty()).then(
+                    || {
+                        c.additional_edits
+                            .iter()
+                            .map(|(s, t)| {
+                                TextEdit::new(self.range(&a.db, *s), t.clone())
+                            })
+                            .collect()
+                    },
+                ),
                 label: c.label,
                 kind: Some(completion_kind(c.kind)),
                 detail: c.detail,
@@ -386,6 +396,72 @@ impl Server<'_> {
             changes: Some(changes),
             ..Default::default()
         }))
+    }
+
+    pub(super) fn code_action(
+        &mut self,
+        p: CodeActionParams,
+    ) -> Result<Option<CodeActionResponse>> {
+        let Some(t) = self.target(&p.text_document.uri) else {
+            return Ok(None);
+        };
+        let a = self.analysis(&t);
+        let start = self.offset(&a.db, t.file, p.range.start);
+        let end = self.offset(&a.db, t.file, p.range.end).max(start);
+        let mut out = Vec::new();
+        for action in a.code_actions(t.file, start, end) {
+            let kind = match action.kind {
+                analysis::CodeActionKind::QuickFix => CodeActionKind::QUICKFIX,
+                analysis::CodeActionKind::Generate => CodeActionKind::REFACTOR,
+                analysis::CodeActionKind::Rewrite => {
+                    CodeActionKind::REFACTOR_REWRITE
+                }
+                analysis::CodeActionKind::Inline => {
+                    CodeActionKind::REFACTOR_INLINE
+                }
+            };
+            if let Some(only) = &p.context.only {
+                if !only.iter().any(|o| {
+                    kind.as_str() == o.as_str()
+                        || kind
+                            .as_str()
+                            .starts_with(&format!("{}.", o.as_str()))
+                }) {
+                    continue;
+                }
+            }
+            let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
+            for (span, text) in &action.edits {
+                let Some(loc) = self.location(&a.db, *span) else {
+                    continue;
+                };
+                changes
+                    .entry(loc.uri)
+                    .or_default()
+                    .push(TextEdit::new(loc.range, text.clone()));
+            }
+            let diagnostics = action.fixes.map(|s| {
+                let range = self.range(&a.db, s);
+                p.context
+                    .diagnostics
+                    .iter()
+                    .filter(|d| d.range == range)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            });
+            out.push(CodeActionOrCommand::CodeAction(CodeAction {
+                title: action.title,
+                kind: Some(kind),
+                diagnostics: diagnostics.filter(|d| !d.is_empty()),
+                edit: Some(WorkspaceEdit {
+                    changes: Some(changes),
+                    ..Default::default()
+                }),
+                is_preferred: action.preferred.then_some(true),
+                ..Default::default()
+            }));
+        }
+        Ok(Some(out))
     }
 
     pub(super) fn inlay_hints(

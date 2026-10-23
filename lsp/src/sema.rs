@@ -109,6 +109,46 @@ pub struct CallSite {
     pub arg_spans: Vec<Span>,
 }
 
+/// What an unresolved name was expected to be, for quick fixes.
+#[derive(Clone, Debug)]
+pub enum UnresolvedKind {
+    /// A value in an expression.
+    Name,
+    Type,
+    State,
+    MatchKind,
+    /// A member of a value of this type.
+    Member(Ty),
+    /// An action named by a table (`actions`, `default_action`, entries),
+    /// with guessed parameter types and names from its arguments.
+    Action {
+        table: Span,
+        params: Vec<(String, String)>,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub struct Unresolved {
+    pub name: String,
+    pub span: Span,
+    pub kind: UnresolvedKind,
+    /// The scope the name was looked up in.
+    pub scope: ScopeId,
+    /// The enclosing parser, for creating a missing state.
+    pub parser: Option<DefId>,
+}
+
+/// An action used by a table's `default_action` or entries but missing from
+/// its `actions` list.
+#[derive(Clone, Debug)]
+pub struct NotInActions {
+    pub name: String,
+    /// The use of the action.
+    pub span: Span,
+    /// The closing `}` of the `actions` list.
+    pub list_end: Span,
+}
+
 #[derive(Debug, Default)]
 pub struct Sema {
     pub defs: Vec<Def>,
@@ -119,6 +159,19 @@ pub struct Sema {
     pub diagnostics: Vec<Diagnostic>,
     /// Members of every `error { ... }` declaration.
     pub errors: Vec<DefId>,
+    /// Names that did not resolve, including those not reported because
+    /// an include is missing.
+    pub unresolved: Vec<Unresolved>,
+    pub not_in_actions: Vec<NotInActions>,
+    /// Each table's `actions` list.
+    pub table_actions: HashMap<DefId, Vec<DefId>>,
+    /// Source text of the declared type of variables, constants,
+    /// parameters, and fields.
+    pub type_text: HashMap<DefId, String>,
+    /// Values of constants initialized with an integer literal.
+    pub const_values: HashMap<DefId, u128>,
+    /// Local declarations that are never referenced.
+    pub unused: Vec<DefId>,
     builtins: HashMap<&'static str, DefId>,
 }
 
@@ -276,9 +329,24 @@ impl Sema {
                 }
             }
         }
+        self.visible_from(best.map_or(ScopeId(0), |b| b.0))
+    }
+
+    /// Names x4c declares implicitly that the program does not declare.
+    pub fn implicit_names(&self) -> Vec<DefId> {
+        self.builtins
+            .iter()
+            .filter(|(k, _)| k.starts_with("x4c."))
+            .map(|(_, &d)| d)
+            .filter(|&d| !self.scopes[0].names.contains_key(&self.def(d).name))
+            .collect()
+    }
+
+    /// Names visible from a scope, innermost first.
+    pub fn visible_from(&self, scope: ScopeId) -> Vec<DefId> {
         let mut out = Vec::new();
         let mut seen = std::collections::HashSet::new();
-        let mut cur = Some(best.map_or(ScopeId(0), |b| b.0));
+        let mut cur = Some(scope);
         while let Some(id) = cur {
             let scope = &self.scopes[id.0 as usize];
             // Declaration order within each scope.
@@ -310,7 +378,7 @@ fn subst(ty: &Ty, env: &[(DefId, Ty)]) -> Ty {
 }
 
 /// Whether a kind names a type (as opposed to a value).
-fn is_type_kind(kind: SymbolKind) -> bool {
+pub fn is_type_kind(kind: SymbolKind) -> bool {
     use SymbolKind::*;
     matches!(
         kind,
@@ -353,6 +421,8 @@ pub fn analyze(
         local: false,
         report_unresolved,
         quiet: false,
+        action_table: None,
+        parser: None,
     };
     r.s.scopes.push(Scope {
         parent: None,
@@ -367,6 +437,7 @@ pub fn analyze(
     for d in &program.decls {
         r.walk_decl(d);
     }
+    r.find_unused();
     r.s
 }
 
@@ -380,6 +451,11 @@ struct Resolver<'a> {
     report_unresolved: bool,
     /// Suppresses references and diagnostics during type pre-passes.
     quiet: bool,
+    /// While resolving a table's action reference: the table's name span
+    /// and the guessed parameters of the action.
+    action_table: Option<(Span, Vec<(String, String)>)>,
+    /// The parser being walked.
+    parser: Option<DefId>,
 }
 
 impl Resolver<'_> {
@@ -595,12 +671,34 @@ impl Resolver<'_> {
         }
     }
 
-    fn unresolved(&mut self, name: &Name, what: &str) {
-        if self.report_unresolved && !self.quiet && !name.is_missing() {
-            self.s.diagnostics.push(Diagnostic::error(
-                name.span,
-                format!("cannot find {what} `{}` in this scope", name.text),
-            ));
+    fn unresolved(&mut self, name: &Name, what: &str, kind: UnresolvedKind) {
+        if self.quiet || name.is_missing() {
+            return;
+        }
+        let kind = match (kind, &self.action_table) {
+            (UnresolvedKind::Name, Some((table, params))) => {
+                UnresolvedKind::Action {
+                    table: *table,
+                    params: params.clone(),
+                }
+            }
+            (k, _) => k,
+        };
+        self.s.unresolved.push(Unresolved {
+            name: name.text.clone(),
+            span: name.span,
+            kind,
+            scope: self.scope,
+            parser: self.parser,
+        });
+        if self.report_unresolved {
+            self.s.diagnostics.push(
+                Diagnostic::error(
+                    name.span,
+                    format!("cannot find {what} `{}` in this scope", name.text),
+                )
+                .with_code("unresolved"),
+            );
         }
     }
 
@@ -680,6 +778,10 @@ impl Resolver<'_> {
                 })
             })
             .collect();
+        for (p, &id) in params.iter().zip(&ids) {
+            let t = self.text(p.ty.span);
+            self.s.type_text.insert(id, t);
+        }
         let required = params
             .iter()
             .filter(|p| {
@@ -704,12 +806,21 @@ impl Resolver<'_> {
                     c.name.text,
                     self.text(c.value.span)
                 );
-                self.define(&c.name, SymbolKind::Constant, c.span, detail);
+                let id =
+                    self.define(&c.name, SymbolKind::Constant, c.span, detail);
+                self.s.type_text.insert(id, self.text(c.ty.span));
+                if let ExprKind::Int(IntLit { value: Some(v), .. }) =
+                    &c.value.kind
+                {
+                    self.s.const_values.insert(id, *v);
+                }
             }
             Decl::Var(v) => {
                 let detail =
                     format!("{} {}", self.text(v.ty.span), v.name.text);
-                self.define(&v.name, SymbolKind::Variable, v.span, detail);
+                let id =
+                    self.define(&v.name, SymbolKind::Variable, v.span, detail);
+                self.s.type_text.insert(id, self.text(v.ty.span));
             }
             Decl::Typedef(t) => {
                 if let Some(inline) = &t.inline_decl {
@@ -764,6 +875,10 @@ impl Resolver<'_> {
                         })
                         .collect()
                 });
+                for (f, &fid) in s.fields.iter().zip(&fields) {
+                    let t = self.text(f.ty.span);
+                    self.s.type_text.insert(fid, t);
+                }
                 self.check_member_duplicates(&fields);
                 self.s.defs[id.0 as usize].members = fields;
             }
@@ -1198,6 +1313,7 @@ impl Resolver<'_> {
                     return;
                 };
                 self.s.defs[id.0 as usize].ty = Ty::Def(id, Vec::new());
+                let saved_parser = self.parser.replace(id);
                 self.with_scope(Some(p.span), |r| {
                     r.enter_type_params(id);
                     let params = r.s.def(id).params.clone();
@@ -1227,6 +1343,7 @@ impl Resolver<'_> {
                         })
                     });
                 });
+                self.parser = saved_parser;
             }
             Decl::Control(c) => {
                 let Some(id) = self.def_for(&c.name) else {
@@ -1369,7 +1486,7 @@ impl Resolver<'_> {
                     let b = self.s.builtins[name.text.as_str()];
                     self.add_ref(name.span, b, false);
                 }
-                _ => self.unresolved(name, "state"),
+                _ => self.unresolved(name, "state", UnresolvedKind::State),
             },
         }
     }
@@ -1394,6 +1511,26 @@ impl Resolver<'_> {
 
     fn table(&mut self, t: &TableDecl) {
         let id = self.def_for(&t.name);
+        // The `actions` list first: other properties are checked against it.
+        let mut listed: Option<(Vec<DefId>, Span)> = None;
+        for p in &t.properties {
+            if let PropertyValue::Actions(refs) = &p.value {
+                let mut defs = Vec::new();
+                for a in refs {
+                    if let Some(&d) = self.action_ref(a, t).first() {
+                        defs.push(d);
+                    }
+                }
+                let text = self.db.slice(p.span);
+                if let Some(close) = text.rfind('}') {
+                    let at = p.span.start + close as u32;
+                    listed = Some((defs, Span::new(p.span.file, at, at + 1)));
+                }
+            }
+        }
+        if let (Some(id), Some((defs, _))) = (id, &listed) {
+            self.s.table_actions.insert(id, defs.clone());
+        }
         for p in &t.properties {
             match &p.value {
                 PropertyValue::Key(elems) => {
@@ -1402,26 +1539,106 @@ impl Resolver<'_> {
                         self.match_kind_ref(&k.match_kind);
                     }
                 }
-                PropertyValue::Actions(refs) => {
-                    for a in refs {
-                        self.action_ref(a);
-                    }
-                }
+                PropertyValue::Actions(_) => {}
                 PropertyValue::Entries(entries) => {
                     for e in entries {
                         if let Some(p) = &e.priority {
                             self.expr(p);
                         }
                         self.keyset(&e.keyset);
-                        self.action_ref(&e.action);
+                        let defs = self.action_ref(&e.action, t);
+                        self.check_listed(&e.action.name.name, &defs, &listed);
                     }
+                }
+                PropertyValue::Expr(e) if p.name.text == "default_action" => {
+                    let (path, args) = match &e.kind {
+                        ExprKind::Path(path) => (path, None),
+                        ExprKind::Call { callee, args, .. } => {
+                            match &callee.kind {
+                                ExprKind::Path(path) => (path, Some(args)),
+                                _ => {
+                                    self.expr(e);
+                                    continue;
+                                }
+                            }
+                        }
+                        _ => {
+                            self.expr(e);
+                            continue;
+                        }
+                    };
+                    let a = ActionRef {
+                        annotations: Vec::new(),
+                        name: path.clone(),
+                        args: args.cloned(),
+                        span: e.span,
+                    };
+                    let defs = self.action_ref(&a, t);
+                    self.check_listed(&path.name, &defs, &listed);
                 }
                 PropertyValue::Expr(e) => {
                     self.expr(e);
                 }
             }
         }
-        let _ = id;
+    }
+
+    /// Report an action used by a table but missing from its `actions`.
+    fn check_listed(
+        &mut self,
+        name: &Name,
+        defs: &[DefId],
+        listed: &Option<(Vec<DefId>, Span)>,
+    ) {
+        let (Some(&d), Some((list, list_end))) = (defs.first(), listed) else {
+            return;
+        };
+        if self.s.def(d).kind != SymbolKind::Action || list.contains(&d) {
+            return;
+        }
+        self.s.diagnostics.push(
+            Diagnostic::error(
+                name.span,
+                format!("`{}` is not in the table's `actions` list", name.text),
+            )
+            .with_code("not-in-actions"),
+        );
+        self.s.not_in_actions.push(NotInActions {
+            name: name.text.clone(),
+            span: name.span,
+            list_end: *list_end,
+        });
+    }
+
+    /// The type and a parameter name for an argument, guessed for creating
+    /// a missing action.
+    fn guess_param(&mut self, i: usize, e: &Expr) -> (String, String) {
+        let saved = std::mem::replace(&mut self.quiet, true);
+        let (_, defs) = self.expr_inner(e);
+        self.quiet = saved;
+        let name = match &e.kind {
+            ExprKind::Path(p) => p.name.text.clone(),
+            ExprKind::Member { member, .. } => member.text.clone(),
+            _ => format!("arg{i}"),
+        };
+        let ty = match (&e.kind, defs.first()) {
+            (_, Some(d)) if self.s.type_text.contains_key(d) => {
+                self.s.type_text[d].clone()
+            }
+            (
+                ExprKind::Int(IntLit {
+                    width: Some(w),
+                    signed,
+                    ..
+                }),
+                _,
+            ) => {
+                format!("{}<{w}>", if *signed { "int" } else { "bit" })
+            }
+            (ExprKind::Bool(_), _) => "bool".into(),
+            _ => "bit<32>".into(),
+        };
+        (ty, name)
     }
 
     fn match_kind_ref(&mut self, name: &Name) {
@@ -1434,12 +1651,23 @@ impl Resolver<'_> {
             .find(|&d| self.s.def(d).kind == SymbolKind::MatchKind);
         match found {
             Some(d) => self.add_ref(name.span, d, false),
-            None => self.unresolved(name, "match kind"),
+            None => {
+                self.unresolved(name, "match kind", UnresolvedKind::MatchKind)
+            }
         }
     }
 
-    fn action_ref(&mut self, a: &ActionRef) {
+    fn action_ref(&mut self, a: &ActionRef, table: &TableDecl) -> Vec<DefId> {
+        let params = a
+            .args
+            .iter()
+            .flatten()
+            .enumerate()
+            .map(|(i, arg)| self.guess_param(i, &arg.value))
+            .collect();
+        let saved = self.action_table.replace((table.name.span, params));
         let defs = self.path(&a.name, Want::Value);
+        self.action_table = saved;
         if let Some(args) = &a.args {
             let span = Span::new(
                 a.name.span.file,
@@ -1448,6 +1676,55 @@ impl Resolver<'_> {
             );
             self.call_site(span, defs.clone(), args);
             self.args(args, &defs);
+        }
+        defs
+    }
+
+    /// Record local declarations that nothing refers to. A declaration in a
+    /// fragment included several times is unused only if every copy is.
+    fn find_unused(&mut self) {
+        let mut used: std::collections::HashSet<Span> = Default::default();
+        for r in &self.s.refs {
+            if let Some(s) = self.s.def(r.def).name_span {
+                used.insert(s);
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        for (i, d) in self.s.defs.iter().enumerate() {
+            let Some(span) = d.name_span else { continue };
+            let candidate = matches!(
+                d.kind,
+                SymbolKind::Action
+                    | SymbolKind::Table
+                    | SymbolKind::Instance
+                    | SymbolKind::Variable
+                    | SymbolKind::Constant
+                    | SymbolKind::ValueSet
+            ) && d.parent.is_some_and(|p| {
+                matches!(
+                    self.s.def(p).kind,
+                    SymbolKind::Control
+                        | SymbolKind::Parser
+                        | SymbolKind::Action
+                        | SymbolKind::Function
+                )
+            });
+            if candidate
+                && !d.name.is_empty()
+                && !used.contains(&span)
+                && seen.insert(span)
+            {
+                self.s.unused.push(DefId(i as u32));
+                self.s.diagnostics.push(
+                    Diagnostic::new(
+                        span,
+                        crate::diag::Severity::Hint,
+                        format!("`{}` is never used", d.name),
+                    )
+                    .with_code("unused"),
+                );
+                self.s.diagnostics.last_mut().unwrap().unnecessary = true;
+            }
         }
     }
 
@@ -1589,8 +1866,12 @@ impl Resolver<'_> {
         if let Some(&first) = defs.first() {
             self.add_ref(p.name.span, first, false);
         } else {
-            let what = if want == Want::Type { "type" } else { "name" };
-            self.unresolved(&p.name, what);
+            let (what, kind) = if want == Want::Type {
+                ("type", UnresolvedKind::Type)
+            } else {
+                ("name", UnresolvedKind::Name)
+            };
+            self.unresolved(&p.name, what, kind);
         }
         defs
     }
@@ -1732,9 +2013,17 @@ impl Resolver<'_> {
                             }
                             None => format!("no member `{}`", member.text),
                         };
-                        self.s
-                            .diagnostics
-                            .push(Diagnostic::error(member.span, msg));
+                        self.s.diagnostics.push(
+                            Diagnostic::error(member.span, msg)
+                                .with_code("unknown-member"),
+                        );
+                        self.s.unresolved.push(Unresolved {
+                            name: member.text.clone(),
+                            span: member.span,
+                            kind: UnresolvedKind::Member(base_ty.clone()),
+                            scope: self.scope,
+                            parser: self.parser,
+                        });
                     }
                     (Ty::Unknown, Vec::new())
                 }

@@ -549,6 +549,356 @@ control c(inout headers_t hdr) {
     assert_eq!(ws, ["ipv4_h", "ipv4"]);
 }
 
+// ---------------------------------------------------------------------------
+// Code actions
+
+impl Fixture {
+    /// Titles of the actions at a mark.
+    fn actions(&self, mark: &str) -> Vec<String> {
+        let (f, o) = self.at(mark);
+        self.a
+            .code_actions(f, o, o)
+            .into_iter()
+            .map(|a| a.title)
+            .collect()
+    }
+
+    /// The text of `file` after applying the action titled `title` at
+    /// `mark`.
+    fn apply(&self, mark: &str, title: &str, file: &str) -> String {
+        let (f, o) = self.at(mark);
+        let action = self
+            .a
+            .code_actions(f, o, o)
+            .into_iter()
+            .find(|a| a.title == title)
+            .unwrap_or_else(|| {
+                panic!("no action {title:?}: {:?}", self.actions(mark))
+            });
+        let target = self
+            .a
+            .db
+            .file_id(&PathBuf::from(format!("/t/{file}")))
+            .unwrap();
+        let mut text = self.a.db.text(target).to_string();
+        let mut edits: Vec<_> = action
+            .edits
+            .into_iter()
+            .filter(|(s, _)| s.file == target)
+            .collect();
+        edits.sort_by_key(|(s, _)| std::cmp::Reverse(s.start));
+        for (s, t) in edits {
+            text.replace_range(s.start as usize..s.end as usize, &t);
+        }
+        text
+    }
+}
+
+#[test]
+fn quick_fixes_for_unresolved_names() {
+    let f = fixture(&[
+        (
+            "main.p4",
+            "#include \"headers.p4\"
+control c(inout headers_t hdr) {
+    action fwd_port(bit<9> port) { }
+    table t {
+        key = { hdr.ipv4.dst: exatc$0; }
+        actions = { fwd_prot$1; NoAction; }
+        default_action = set$2_nexthop(9w1, hdr.ipv4.dst, hdr.ipv4.dst);
+    }
+    apply { hdr.ipv4.tl$3 = 1; }
+}
+parser p(packet_in pkt) {
+    state start { transition parse$4_eth; }
+}
+",
+        ),
+        ("headers.p4", HEADERS),
+    ]);
+    assert_eq!(f.actions("0"), ["Change to `exact`"]);
+    assert_eq!(f.actions("1")[0], "Change to `fwd_port`");
+    assert_eq!(f.actions("3"), ["Change to `ttl`"]);
+    // Parameter types come from the arguments; duplicate names are made
+    // unique.
+    let created = f.apply("2", "Create action `set_nexthop`", "main.p4");
+    assert!(
+        created.contains(
+            "    action set_nexthop(bit<9> arg0, bit<32> dst, bit<32> dst_) {\n    }\n\n    table t {"
+        ),
+        "{created}"
+    );
+    let state = f.apply("4", "Create state `parse_eth`", "main.p4");
+    assert!(
+        state.ends_with(
+            "    state start { transition parse_eth; }\n\n    state parse_eth {\n        transition accept;\n    }\n}\n"
+        ),
+        "{state}"
+    );
+}
+
+#[test]
+fn quick_fixes_for_tables_semicolons_and_unused() {
+    let f = fixture(&[(
+        "main.p4",
+        "#include <core.p4>
+control c() {
+    action a() { }
+    action b() { }
+    action unus$2ed() { }
+    table t {
+        actions = {
+            a;
+        }
+        default_action = b$0();
+    }
+    table u {
+        actions = { a; }
+        const entries = { 1 : b$1(); }
+        key = { 8w1: exact; }
+    }
+    apply {
+        bit<8> x = 1$3
+        t.apply();
+        u.apply();
+        x = x + 1;
+    }
+}
+",
+    )]);
+    let errors = f.errors();
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("`b` is not in the table's `actions` list")),
+        "{errors:?}"
+    );
+    let fixed = f.apply("0", "Add `b` to the table's actions", "main.p4");
+    assert!(
+        fixed.contains(
+            "        actions = {\n            a;\n            b;\n        }"
+        ),
+        "{fixed}"
+    );
+    let fixed = f.apply("1", "Add `b` to the table's actions", "main.p4");
+    assert!(fixed.contains("actions = { a; b; }"), "{fixed}");
+    let fixed = f.apply("2", "Remove unused `unused`", "main.p4");
+    assert!(
+        fixed.contains("    action b() { }\n    table t {"),
+        "{fixed}"
+    );
+    let fixed = f.apply("3", "Insert `;`", "main.p4");
+    assert!(fixed.contains("bit<8> x = 1;\n"), "{fixed}");
+}
+
+#[test]
+fn unused_declarations() {
+    let f = fixture(&[(
+        "main.p4",
+        "extern bit<8> now();
+control c() {
+    action a() { }
+    table t { actions = { a; } }
+    apply {
+        bit<8> unused = 1;
+        bit<8> st$0amp = now();
+#ifdef OTHER
+        t.apply();
+#endif
+    }
+}
+",
+    )]);
+    let unused: Vec<_> =
+        f.a.diagnostics()
+            .iter()
+            .filter(|d| d.code == Some("unused"))
+            .map(|d| f.show(d.span))
+            .collect();
+    // `t` is used in a configuration the preprocessor skipped.
+    assert_eq!(unused, ["main.p4:6:unused", "main.p4:7:stamp"]);
+    // Removing `stamp` would remove the call to `now()`.
+    assert!(!f.actions("0").iter().any(|t| t.starts_with("Remove")));
+}
+
+#[test]
+fn generate_switch_cases_emits_and_parser_states() {
+    let f = fixture(&[
+        (
+            "main.p4",
+            "#include <core.p4>
+#include \"headers.p4\"
+extern packet_out { void emit<T>(in T hdr); }
+control c() {
+    action a() { }
+    action b() { }
+    table t { actions = { a; b; NoAction; } }
+    apply {
+        switch (t.apply().action_run) {
+            a: { }
+        $0}
+    }
+}
+control dep(packet_out pkt, in headers_t hdr) {
+    apply {
+        pkt.emit(hdr.ipv4);$1
+    }
+}
+parser p(packet_in pkt, out headers_t hdr) {
+    state start {$2
+        transition accept;
+    }
+}
+",
+        ),
+        ("headers.p4", HEADERS),
+    ]);
+    let fixed = f.apply("0", "Add 2 missing `action_run` case(s)", "main.p4");
+    assert!(
+        fixed.contains("            a: { }\n            b: { }\n            NoAction: { }\n        }"),
+        "{fixed}"
+    );
+    let fixed = f.apply("1", "Generate `emit` calls for `hdr`", "main.p4");
+    assert!(
+        fixed.contains(
+            "        pkt.emit(hdr.ipv4);\n        pkt.emit(hdr.stack);\n    }"
+        ),
+        "{fixed}"
+    );
+    // Header stacks are not extracted by a generated state.
+    let fixed = f.apply(
+        "2",
+        "Generate parser states for 1 unextracted header(s)",
+        "main.p4",
+    );
+    assert!(
+        fixed.contains("    state parse_ipv4 {\n        pkt.extract(hdr.ipv4);\n        transition accept;\n    }\n}"),
+        "{fixed}"
+    );
+}
+
+#[test]
+fn literal_to_constant_and_inline_macro() {
+    let f = fixture(&[(
+        "main.p4",
+        "const bit<16> ETHERTYPE_IPV4 = 0x0800;
+const bit<8> SMALL = 0x0800;
+#define TWICE(x) ((x) + (x))
+control c(inout bit<16> t) {
+    apply {
+        if (t == 16w0x08$000) { }
+        if (t == 0x08$100) { }
+        t = TW$2ICE(t);
+    }
+}
+",
+    )]);
+    // The 8-bit constant has the same value but not the literal's width.
+    assert_eq!(f.actions("0"), ["Replace with `ETHERTYPE_IPV4`"]);
+    // An unsized literal matches any width.
+    assert_eq!(
+        f.actions("1"),
+        ["Replace with `ETHERTYPE_IPV4`", "Replace with `SMALL`"]
+    );
+    let fixed = f.apply("2", "Inline macro `TWICE`", "main.p4");
+    assert!(fixed.contains("t = ((t) + (t));"), "{fixed}");
+}
+
+#[test]
+fn missing_includes_from_header_directories() {
+    // Headers live on disk because the header index scans directories.
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().canonicalize().unwrap();
+    let write = |rel: &str, text: &str| {
+        let p = dir.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, text).unwrap();
+    };
+    write("p4include/core.p4", CORE);
+    write(
+        "p4include/bmv2/psa.p4",
+        "#include <core.p4>\nextern Register<T, I> { Register(bit<32> n); }\n",
+    );
+    write(
+        "tofino/tna.p4",
+        "#include <core.p4>\nheader tna_h { bit<8> x; }\n",
+    );
+    // Ranked behind `bmv2/psa.p4` by default (larger include closure), but
+    // in the same directory as the program's `tna.p4`.
+    write(
+        "tofino/tna_extra.p4",
+        "#include <core.p4>\n#include \"tna.p4\"\nextern Register<T, I> { Register(bit<32> n); }\n",
+    );
+    write(
+        "prog/main.p4",
+        "// Copyright\n#include <core.p4>\n#include <tna.p4>\n#include \"frag.p4\"\n\ncontrol c() {\n    Register<bit<8>, bit<32>>(4) r;\n    apply { }\n}\n",
+    );
+    write("prog/frag.p4", "control d() {\n    Register<bit<8>, bit<32>>(4) r;\n    apply { }\n}\n");
+    let opts = Options {
+        include_dirs: vec![dir.join("p4include"), dir.join("tofino")],
+        defines: vec![],
+    };
+    let mut db = SourceDb::new(HashMap::new());
+    let root = db.load(&dir.join("prog/main.p4")).unwrap();
+    let a = Analysis::new(db, root, &opts);
+    let main = root;
+    let frag = a.db.file_id(&dir.join("prog/frag.p4")).unwrap();
+    let at = |file: FileId, needle: &str| {
+        a.db.text(file).find(needle).unwrap() as u32 + 3
+    };
+    let apply = |file: FileId, edits: &[(Span, String)]| {
+        let mut text = a.db.text(file).to_string();
+        let mut edits = edits.to_vec();
+        edits.sort_by_key(|(s, _)| std::cmp::Reverse(s.start));
+        for (s, t) in edits {
+            assert_eq!(s.file, file);
+            text.replace_range(s.start as usize..s.end as usize, &t);
+        }
+        text
+    };
+
+    // The quick fix prefers the header next to the program's includes and
+    // inserts after the last include.
+    let fixes: Vec<_> = a
+        .code_actions(main, at(main, "Register"), at(main, "Register"))
+        .into_iter()
+        .filter(|c| c.title.starts_with("Add `#include"))
+        .collect();
+    let titles: Vec<_> = fixes.iter().map(|c| c.title.as_str()).collect();
+    assert_eq!(
+        titles,
+        [
+            "Add `#include <tna_extra.p4>`",
+            "Add `#include <bmv2/psa.p4>`"
+        ]
+    );
+    assert!(
+        apply(main, &fixes[0].edits).starts_with(
+            "// Copyright\n#include <core.p4>\n#include <tna.p4>\n#include \"frag.p4\"\n#include <tna_extra.p4>\n\ncontrol c"
+        ),
+        "{}",
+        apply(main, &fixes[0].edits)
+    );
+
+    // Completing the name in the root carries the include along.
+    let items = a.completions(main, at(main, "Register") + 2);
+    let item = items.iter().find(|c| c.label == "Register").unwrap();
+    assert_eq!(item.detail.as_deref(), Some("#include <tna_extra.p4>"));
+    assert!(apply(main, &item.additional_edits)
+        .contains("#include \"frag.p4\"\n#include <tna_extra.p4>\n"));
+
+    // A fragment's include would go into the root, so the fragment gets the
+    // quick fix (editing the root) but no completion edit in another file.
+    let items = a.completions(frag, at(frag, "Register") + 2);
+    assert!(!items.iter().any(|c| c.label == "Register"));
+    let fix = a
+        .code_actions(frag, at(frag, "Register"), at(frag, "Register"))
+        .into_iter()
+        .find(|c| c.title == "Add `#include <tna_extra.p4>`")
+        .unwrap();
+    assert!(fix.edits.iter().all(|(s, _)| s.file == main));
+}
+
 /// Inputs nested or chained far beyond any real program are cut off with
 /// one error each, instead of overflowing the stack (which aborts the
 /// server) or flooding the editor with diagnostics.
@@ -593,5 +943,20 @@ fn pathological_nesting_is_bounded() {
             "{expected}: {:?}",
             &errors[..errors.len().min(5)]
         );
+    }
+}
+
+#[test]
+fn completion_after_multibyte_chars() {
+    // `$0` follows a two-byte `é`; `$1` is a valid offset for a request,
+    // and the offset inside `é` is not, but neither may panic.
+    let f = fixture(&[(
+        "main.p4",
+        "extern void f(in bit<8> a);\ncontrol C() { apply { f(\"é$0ab$1\"); } }\n",
+    )]);
+    let (file, inside) = f.at("0");
+    for o in [inside - 1, inside, f.at("1").1] {
+        f.a.completions(file, o);
+        f.a.signature_help(file, o);
     }
 }

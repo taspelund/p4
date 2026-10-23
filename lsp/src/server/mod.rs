@@ -203,6 +203,18 @@ impl<'a> Server<'a> {
                 retrigger_characters: Some(vec![",".into()]),
                 ..Default::default()
             }),
+            code_action_provider: Some(CodeActionProviderCapability::Options(
+                CodeActionOptions {
+                    code_action_kinds: Some(vec![
+                        CodeActionKind::QUICKFIX,
+                        CodeActionKind::REFACTOR,
+                        CodeActionKind::REFACTOR_REWRITE,
+                        CodeActionKind::REFACTOR_INLINE,
+                    ]),
+                    resolve_provider: Some(false),
+                    work_done_progress_options: Default::default(),
+                },
+            )),
             rename_provider: Some(OneOf::Right(RenameOptions {
                 prepare_provider: Some(true),
                 work_done_progress_options: Default::default(),
@@ -335,6 +347,9 @@ impl<'a> Server<'a> {
                 .dispatch::<req::PrepareRenameRequest>(r, Self::prepare_rename),
             req::Rename::METHOD => {
                 self.dispatch::<req::Rename>(r, Self::rename)
+            }
+            req::CodeActionRequest::METHOD => {
+                self.dispatch::<req::CodeActionRequest>(r, Self::code_action)
             }
             req::InlayHintRequest::METHOD => {
                 self.dispatch::<req::InlayHintRequest>(r, Self::inlay_hints)
@@ -716,7 +731,9 @@ impl<'a> Server<'a> {
         let inactive = self.roots.inactive_regions();
         diagnostics
             .iter()
-            .filter(|d| d.span.file == file && (inactive || !d.unnecessary))
+            .filter(|d| {
+                d.span.file == file && (inactive || d.code != Some("inactive"))
+            })
             .map(|d| {
                 let mut message = d.message.clone();
                 let mut related = Vec::new();
@@ -751,6 +768,9 @@ impl<'a> Server<'a> {
                         Severity::Hint => DiagnosticSeverity::HINT,
                     }),
                     source: Some(SOURCE.into()),
+                    code: d
+                        .code
+                        .map(|c| lsp_types::NumberOrString::String(c.into())),
                     message,
                     related_information: (!related.is_empty())
                         .then_some(related),

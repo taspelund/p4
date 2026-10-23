@@ -83,6 +83,34 @@ pub struct Completion {
     pub kind: SymbolKind,
     pub detail: Option<String>,
     pub documentation: Option<String>,
+    /// Edits applied along with the completion, such as an `#include` for
+    /// a name from a header the program does not include yet. Always in
+    /// the file being completed.
+    pub additional_edits: Vec<(Span, String)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CodeActionKind {
+    QuickFix,
+    /// Generates code (fill `switch` cases, deparser `emit`s, ...).
+    Generate,
+    /// Replaces code with equivalent code.
+    Rewrite,
+    /// Inlines a definition, such as a macro.
+    Inline,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodeAction {
+    pub title: String,
+    pub kind: CodeActionKind,
+    /// Replacements, possibly in several files. Insertions have empty
+    /// spans.
+    pub edits: Vec<(Span, String)>,
+    /// The span of the diagnostic this fixes, if any.
+    pub fixes: Option<Span>,
+    /// The fix the editor may apply without asking.
+    pub preferred: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -168,6 +196,8 @@ pub struct Analysis {
     pub pp: preprocess::Output,
     pub parse: syntax::Parse,
     pub sema: Sema,
+    /// The preprocessor options the root was analyzed with.
+    pub opts: Options,
     diagnostics: Vec<Diagnostic>,
 }
 
@@ -178,7 +208,33 @@ impl Analysis {
         // A missing include makes every name it declares unresolved;
         // report the include alone rather than a cascade.
         let complete = pp.includes.iter().all(|i| i.target.is_some());
-        let sema = sema::analyze(&parse.program, &db, complete);
+        let mut sema = sema::analyze(&parse.program, &db, complete);
+        // A declaration used only in code the preprocessor skipped (another
+        // build configuration) or in a macro body is not unused.
+        let hidden_use = |name: &str| {
+            let is_word = |text: &str| {
+                text.match_indices(name).any(|(i, _)| {
+                    let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+                    !text[..i].ends_with(ident)
+                        && !text[i + name.len()..].starts_with(ident)
+                })
+            };
+            pp.inactive.iter().any(|&s| is_word(db.slice(s)))
+                || pp.macros.iter().any(|m| is_word(&m.body))
+        };
+        let hidden: Vec<Span> = sema
+            .unused
+            .iter()
+            .filter(|&&d| hidden_use(&sema.def(d).name))
+            .filter_map(|&d| sema.def(d).name_span)
+            .collect();
+        sema.unused.retain(|&d| {
+            !sema.defs[d.0 as usize]
+                .name_span
+                .is_some_and(|s| hidden.contains(&s))
+        });
+        sema.diagnostics
+            .retain(|d| d.code != Some("unused") || !hidden.contains(&d.span));
         // Lexical errors in skipped conditional blocks (an apostrophe in
         // `#if 0` prose) do not matter, as in C, and neither do odd
         // characters in annotation bodies.
@@ -206,7 +262,8 @@ impl Analysis {
                 span,
                 Severity::Hint,
                 "inactive preprocessor block",
-            );
+            )
+            .with_code("inactive");
             d.unnecessary = true;
             diagnostics.push(d);
         }
@@ -217,6 +274,7 @@ impl Analysis {
             pp,
             parse,
             sema,
+            opts: opts.clone(),
             diagnostics,
         }
     }
@@ -627,6 +685,7 @@ impl Analysis {
             kind: def.kind,
             detail: Some(def.detail.clone()),
             documentation: self.def_doc(d),
+            additional_edits: Vec::new(),
         }
     }
 
@@ -688,6 +747,7 @@ impl Analysis {
                     kind: SymbolKind::Macro,
                     detail: Some(m.body.clone()),
                     documentation: None,
+                    additional_edits: Vec::new(),
                 });
             }
         }
@@ -698,10 +758,81 @@ impl Analysis {
                     kind: SymbolKind::Keyword,
                     detail: None,
                     documentation: None,
+                    additional_edits: Vec::new(),
                 });
             }
         }
+        out.extend(self.import_completions(file, offset, &seen));
         out
+    }
+
+    /// Directories holding the files the program includes, used to prefer
+    /// headers for the same target when importing.
+    pub fn include_dirs_used(&self) -> Vec<std::path::PathBuf> {
+        let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+        for i in &self.pp.includes {
+            let Some(t) = i.target else { continue };
+            if let Some(d) = self.db.path(t).parent() {
+                if !dirs.iter().any(|x| x == d) {
+                    dirs.push(d.to_path_buf());
+                }
+            }
+        }
+        dirs
+    }
+
+    /// Names from headers the program does not include, each completing
+    /// with an `#include` for its header.
+    fn import_completions(
+        &self,
+        file: FileId,
+        offset: u32,
+        seen: &std::collections::HashSet<String>,
+    ) -> Vec<Completion> {
+        let text = self.db.text(file);
+        let end = text.floor_char_boundary(offset as usize);
+        let start = text[..end]
+            .trim_end_matches(|c: char| c.is_ascii_alphanumeric() || c == '_')
+            .len();
+        let prefix = &text[start..end];
+        if prefix.is_empty() || prefix.starts_with(|c: char| c.is_ascii_digit())
+        {
+            return Vec::new();
+        }
+        let index =
+            crate::headers::HeaderIndex::for_dirs(&self.opts.include_dirs);
+        let mut out = Vec::new();
+        for (name, cand) in index.complete(prefix, &self.include_dirs_used()) {
+            if seen.contains(&name) {
+                continue;
+            }
+            let Some(edit) =
+                crate::headers::include_edit(self, file, &cand.include)
+            else {
+                continue;
+            };
+            if edit.0.file != file {
+                continue;
+            }
+            out.push(Completion {
+                label: name,
+                kind: cand.kind,
+                detail: Some(format!("#include <{}>", cand.include)),
+                documentation: Some(format!("```p4\n{}\n```", cand.detail)),
+                additional_edits: vec![edit],
+            });
+        }
+        out
+    }
+
+    /// Quick fixes and refactorings available for a range.
+    pub fn code_actions(
+        &self,
+        file: FileId,
+        start: u32,
+        end: u32,
+    ) -> Vec<CodeAction> {
+        crate::assists::code_actions(self, file, start, end)
     }
 
     fn signature(&self, d: DefId) -> Signature {
