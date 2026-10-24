@@ -1185,3 +1185,170 @@ control c(inout bit<8> v) {
         .unwrap()
         .starts_with("table ${1:name} {\n\tkey"));
 }
+
+#[test]
+fn type_checks() {
+    let f = fixture(&[(
+        "main.p4",
+        "typedef bit<16> port_t;
+const bit<8> LIMIT = 200;
+extern void log(in bit<8> v);
+extern void read(out bit<8> v);
+extern bit<8> hash<T>(in T data);
+header h_t { bit<8> a; bit<16> b; bool flag; bit<32> isValid; }
+action set(bit<8> v) { }
+control c(inout h_t h, in bit<8> ro, out port_t port) {
+    action fwd(bit<16> p) { port = p; }
+    apply {
+        h.b = h.a;
+        h.b = (bit<16>)h.a + 1;
+        h.b = h.a ++ h.a;
+        h.b[7:0] = h.a;
+        h.a = h.b[8:0];
+        port = h.b;
+        h.flag = h.a;
+        if (h.a) { }
+        if (h.isValid()) { h.isValid = h.isValid + 1; }
+        bool ok = h.a == h.b;
+        h.a = 300;
+        h.a = hash({h.b, h.flag});
+        ro = 1;
+        LIMIT = 1;
+        set(1, 2);
+        read(h.a);
+        read(ro);
+        read(h.a + 1);
+        read(_);
+        log(h.b);
+        h.a = (h.a > 1) ? 8w1 : h.a;
+    }
+}
+",
+    )]);
+    assert_eq!(
+        f.errors(),
+        [
+            "main.p4:11:h.a: mismatched types: expected `bit<16>`, found `bit<8>`",
+            "main.p4:15:h.b[8:0]: mismatched types: expected `bit<8>`, found `bit<9>`",
+            "main.p4:17:h.a: mismatched types: expected `bool`, found `bit<8>`",
+            "main.p4:18:h.a: condition must be `bool`, found `bit<8>`",
+            "main.p4:20:h.a == h.b: mismatched operand types: `bit<8>` and `bit<16>`",
+            "main.p4:23:ro: cannot assign to `ro`: `ro` is an `in` parameter",
+            "main.p4:24:LIMIT: cannot assign to `LIMIT`: `LIMIT` is a constant",
+            "main.p4:25:set: `set` takes 1 argument but 2 were given",
+            "main.p4:27:ro: argument for `out` parameter `v` must be assignable: \
+             `ro` is an `in` parameter",
+            "main.p4:28:h.a + 1: argument for `out` parameter `v` must be assignable",
+            "main.p4:30:h.b: mismatched types: expected `bit<8>`, found `bit<16>`",
+        ]
+    );
+    let warnings: Vec<String> =
+        f.a.diagnostics()
+            .iter()
+            .filter(|d| d.severity == x4c_lsp::diag::Severity::Warning)
+            .map(|d| format!("{}: {}", f.show(d.span), d.message))
+            .collect();
+    assert_eq!(
+        warnings,
+        ["main.p4:21:300: `300` does not fit in `bit<8>` and is truncated"]
+    );
+    // The cast fix parenthesizes compound expressions.
+    let file = f.a.root;
+    let text = f.a.db.text(file).to_string();
+    let apply = |needle: &str| {
+        let o = text.find(needle).unwrap() as u32;
+        let fix =
+            f.a.code_actions(file, o, o)
+                .into_iter()
+                .find(|c| c.title.starts_with("Cast"))
+                .unwrap();
+        let mut out = text.clone();
+        let mut edits = fix.edits;
+        edits.sort_by_key(|(s, _)| std::cmp::Reverse(s.start));
+        for (s, t) in edits {
+            out.replace_range(s.start as usize..s.end as usize, &t);
+        }
+        let line = out[..o as usize].rfind('\n').unwrap() + 1;
+        out[line..].lines().next().unwrap().trim().to_string()
+    };
+    assert_eq!(apply("h.a;\n        h.b = (bit"), "h.b = (bit<16>)h.a;");
+    assert_eq!(apply("h.b[8:0]"), "h.a = (bit<8>)h.b[8:0];");
+}
+
+#[test]
+fn x4c_width_mismatches_are_warnings() {
+    let f = fixture(&[(
+        "main.p4",
+        "control c(inout bit<16> w, inout bit<8> n) { apply { w = n; } }
+SoftNPU(c(), c()) main;
+",
+    )]);
+    assert!(f.errors().is_empty(), "{:?}", f.errors());
+    assert!(f.a.diagnostics().iter().any(|d| d.message
+        == "mismatched types: expected `bit<16>`, found `bit<8>` \
+            (x4c converts implicitly; p4c rejects this)"));
+}
+
+#[test]
+fn keyset_struct_and_packet_type_checks() {
+    let f = fixture(&[(
+        "main.p4",
+        "#include \"core.p4\"
+extern packet_out { void emit<T>(in T hdr); }
+header a_h { bit<8> x; }
+header b_h { bit<8> x; }
+struct s_t { a_h a; b_h b; a_h[2] stack; }
+parser p(packet_in pkt, out s_t s) {
+    state start {
+        pkt.extract(s.a);
+        pkt.extract(s.stack.next);
+        pkt.extract(s);
+        pkt.extract(s.stack);
+        pkt.extract(s.a.x);
+        transition select(s.a.x, s.b.x) {
+            (8w1, 0x2): next;
+            (8w1 &&& 0xf, 4w2): next;
+            (1, 2, 3): accept;
+            (_, 1 .. 0x20): accept;
+            default: reject;
+        }
+    }
+    state next {
+        transition select(s.a.x) { 16w1: accept; 0x10: accept; }
+    }
+}
+control c(inout s_t s, packet_out o) {
+    action a() { }
+    table t {
+        key = { s.a.x: exact; s.b.x: ternary; }
+        actions = { a; }
+        const entries = { (1, 2 &&& 3): a(); (8w1, 9w2): a(); (1): a(); }
+    }
+    apply {
+        s.a = s.b;
+        s.b = s.b;
+        s.a = 1;
+        o.emit(s);
+        o.emit(s.a.x);
+    }
+}
+",
+    )]);
+    assert_eq!(
+        f.errors(),
+        [
+            "main.p4:10:s: `extract` expects a header, found struct `s_t`",
+            "main.p4:11:s.stack: `extract` expects a header, found a header \
+             stack (use `.next` to extract into a stack)",
+            "main.p4:12:s.a.x: `extract` expects a header, found `bit<8>`",
+            "main.p4:15:4w2: mismatched types: expected `bit<8>`, found `bit<4>`",
+            "main.p4:16:(1, 2, 3): expected 2 key values, found 3",
+            "main.p4:22:16w1: mismatched types: expected `bit<8>`, found `bit<16>`",
+            "main.p4:30:9w2: mismatched types: expected `bit<8>`, found `bit<9>`",
+            "main.p4:33:s.b: mismatched types: expected `a_h`, found `b_h`",
+            "main.p4:35:1: mismatched types: expected `a_h`, found `int`",
+            "main.p4:37:s.a.x: `emit` expects a header, header union, struct, \
+             or header stack, found `bit<8>`",
+        ]
+    );
+}

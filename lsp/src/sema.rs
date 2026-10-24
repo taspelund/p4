@@ -149,6 +149,16 @@ pub struct Unresolved {
     pub parser: Option<DefId>,
 }
 
+/// An expression whose type does not match what its context expects.
+#[derive(Clone, Debug)]
+pub struct Mismatch {
+    pub span: Span,
+    /// The expected type, as P4 source (`bit<8>`).
+    pub expected: String,
+    /// Whether the expression needs parentheses under a cast.
+    pub compound: bool,
+}
+
 /// An action used by a table's `default_action` or entries but missing from
 /// its `actions` list.
 #[derive(Clone, Debug)]
@@ -185,6 +195,11 @@ pub struct Sema {
     pub unused: Vec<DefId>,
     /// The underlying type of serializable enums (`enum bit<8> E { ... }`).
     pub enum_reprs: HashMap<DefId, Ty>,
+    /// Parameter directions.
+    pub directions: HashMap<DefId, Direction>,
+    /// Values whose fixed-width type differs from the expected one, for
+    /// the cast quick fix.
+    pub mismatches: Vec<Mismatch>,
     builtins: HashMap<&'static str, DefId>,
 }
 
@@ -524,7 +539,7 @@ impl Resolver<'_> {
                 name_span: None,
                 span: None,
                 parent: None,
-                ty: Ty::Base,
+                ty: if key == "isValid" { Ty::Bool } else { Ty::Base },
                 detail: detail.into(),
                 type_params: Vec::new(),
                 members: Vec::new(),
@@ -794,6 +809,7 @@ impl Resolver<'_> {
         for (p, &id) in params.iter().zip(&ids) {
             let t = self.text(p.ty.span);
             self.s.type_text.insert(id, t);
+            self.s.directions.insert(id, p.direction);
         }
         let required = params
             .iter()
@@ -1202,7 +1218,8 @@ impl Resolver<'_> {
         match d {
             Decl::Const(c) => {
                 let ty = self.resolve_type(&c.ty);
-                self.expr(&c.value);
+                let value = self.expr(&c.value);
+                self.check_assign(&ty, &value, &c.value);
                 if let Some(id) = self.def_for(&c.name) {
                     self.s.defs[id.0 as usize].ty = ty;
                     if let Some(v) = self.const_eval(&c.value) {
@@ -1215,7 +1232,8 @@ impl Resolver<'_> {
             Decl::Var(v) => {
                 let ty = self.resolve_type(&v.ty);
                 if let Some(e) = &v.init {
-                    self.expr(e);
+                    let value = self.expr(e);
+                    self.check_assign(&ty, &value, e);
                 }
                 if let Some(id) = self.def_for(&v.name) {
                     self.s.defs[id.0 as usize].ty = ty;
@@ -1479,11 +1497,10 @@ impl Resolver<'_> {
         match &t.kind {
             TransitionKind::Direct(name) => self.state_ref(name),
             TransitionKind::Select(sel) => {
-                for e in &sel.exprs {
-                    self.expr(e);
-                }
+                let keys: Vec<Ty> =
+                    sel.exprs.iter().map(|e| self.expr(e)).collect();
                 for c in &sel.cases {
-                    self.keyset(&c.keyset);
+                    self.check_keyset(&c.keyset, &keys);
                     self.state_ref(&c.state);
                 }
             }
@@ -1528,6 +1545,48 @@ impl Resolver<'_> {
         }
     }
 
+    /// Resolve a `select` case or table entry and check it against the key
+    /// types.
+    fn check_keyset(&mut self, k: &Keyset, keys: &[Ty]) {
+        let elems: Vec<&Keyset> = match &k.kind {
+            KeysetKind::Tuple(ks) => ks.iter().collect(),
+            _ => vec![k],
+        };
+        let mut values: Vec<Vec<(&Expr, Ty)>> = Vec::new();
+        for e in &elems {
+            let exprs: Vec<&Expr> = match &e.kind {
+                KeysetKind::Expr(v) => vec![v],
+                KeysetKind::Mask(a, b) | KeysetKind::Range(a, b) => vec![a, b],
+                KeysetKind::Tuple(_) => {
+                    self.keyset(e);
+                    vec![]
+                }
+                KeysetKind::Default | KeysetKind::DontCare => vec![],
+            };
+            values.push(exprs.into_iter().map(|v| (v, self.expr(v))).collect());
+        }
+        if matches!(k.kind, KeysetKind::Default | KeysetKind::DontCare) {
+            return;
+        }
+        if elems.len() != keys.len() {
+            if matches!(k.kind, KeysetKind::Tuple(_)) && !keys.is_empty() {
+                let msg = format!(
+                    "expected {} key value{}, found {}",
+                    keys.len(),
+                    if keys.len() == 1 { "" } else { "s" },
+                    elems.len()
+                );
+                self.report(Diagnostic::error(k.span, msg).with_code("type"));
+            }
+            return;
+        }
+        for (vs, key) in values.into_iter().zip(keys) {
+            for (v, ty) in vs {
+                self.check_assign(key, &ty, v);
+            }
+        }
+    }
+
     fn table(&mut self, t: &TableDecl) {
         let id = self.def_for(&t.name);
         // The `actions` list first: other properties are checked against it.
@@ -1550,11 +1609,13 @@ impl Resolver<'_> {
         if let (Some(id), Some((defs, _))) = (id, &listed) {
             self.s.table_actions.insert(id, defs.clone());
         }
+        // Key types, for checking entries (`key` precedes `entries`).
+        let mut keys: Vec<Ty> = Vec::new();
         for p in &t.properties {
             match &p.value {
                 PropertyValue::Key(elems) => {
                     for k in elems {
-                        self.expr(&k.expr);
+                        keys.push(self.expr(&k.expr));
                         self.match_kind_ref(&k.match_kind);
                     }
                 }
@@ -1564,7 +1625,7 @@ impl Resolver<'_> {
                         if let Some(p) = &e.priority {
                             self.expr(p);
                         }
-                        self.keyset(&e.keyset);
+                        self.check_keyset(&e.keyset, &keys);
                         let defs = self.action_ref(&e.action, t);
                         self.check_listed(&e.action.name.name, &defs, &listed);
                     }
@@ -1786,15 +1847,21 @@ impl Resolver<'_> {
     fn stmt(&mut self, s: &Stmt) {
         match &s.kind {
             StmtKind::Decl(d) => self.local_decl(d),
-            StmtKind::Assign { lhs, rhs, .. } => {
-                self.lvalue(lhs);
-                self.expr(rhs);
+            StmtKind::Assign { lhs, op, rhs } => {
+                let target = self.lvalue(lhs);
+                let value = self.expr(rhs);
+                self.check_writable(lhs);
+                match op {
+                    AssignOp::Shl | AssignOp::Shr => {}
+                    _ => self.check_assign(&target, &value, rhs),
+                }
             }
             StmtKind::Call(e) | StmtKind::Expr(e) => {
                 self.expr(e);
             }
             StmtKind::If { cond, then, els } => {
-                self.expr(cond);
+                let t = self.expr(cond);
+                self.check_condition(&t, cond);
                 self.stmt(then);
                 if let Some(e) = els {
                     self.stmt(e);
@@ -1858,9 +1925,9 @@ impl Resolver<'_> {
         }
     }
 
-    fn lvalue(&mut self, e: &Expr) {
+    fn lvalue(&mut self, e: &Expr) -> Ty {
         let start = self.s.refs.len();
-        self.expr(e);
+        let ty = self.expr(e);
         // The written name is the one ending the l-value's base, below any
         // index or slice: `ttl` in `hdr.ipv4.ttl[7:0] = ...`.
         let mut base = e;
@@ -1874,6 +1941,461 @@ impl Resolver<'_> {
             r.span.file == base.span.file && r.span.end == base.span.end
         }) {
             r.write = true;
+        }
+        ty
+    }
+
+    // ----- Type checks -----
+    //
+    // Only certain errors are reported: both types must be fully known
+    // fixed-width types (after following typedefs), so generic, enum,
+    // and unresolved types never produce a diagnostic.
+
+    fn report(&mut self, d: Diagnostic) {
+        if !self.quiet {
+            self.s.diagnostics.push(d);
+        }
+    }
+
+    /// `(signed, width)` of a type that is `bit<W>` or `int<W>` with a
+    /// known width.
+    fn bits(&self, t: &Ty) -> Option<(bool, u32)> {
+        match self.s.resolve_alias(t) {
+            Ty::Bits {
+                signed,
+                width: Some(w),
+            } => Some((signed, w)),
+            _ => None,
+        }
+    }
+
+    /// Whether a type is certainly not `bool`.
+    fn not_bool(&self, t: &Ty) -> bool {
+        matches!(
+            self.s.resolve_alias(t),
+            Ty::Bits { .. } | Ty::Int | Ty::String | Ty::Varbit(_)
+        )
+    }
+
+    fn show_ty(&self, t: &Ty) -> String {
+        match self.s.resolve_alias(t) {
+            Ty::Bits {
+                signed,
+                width: Some(w),
+            } => format!("{}<{w}>", if signed { "int" } else { "bit" }),
+            Ty::Bool => "bool".into(),
+            Ty::Int => "int".into(),
+            Ty::String => "string".into(),
+            Ty::Def(id, _) => self.s.def(id).name.clone(),
+            _ => "?".into(),
+        }
+    }
+
+    /// The struct, header, or header union a type names, after typedefs.
+    fn data_type(&self, t: &Ty) -> Option<DefId> {
+        match self.s.resolve_alias(t) {
+            Ty::Def(id, _)
+                if matches!(
+                    self.s.def(id).kind,
+                    SymbolKind::Struct
+                        | SymbolKind::Header
+                        | SymbolKind::HeaderUnion
+                ) =>
+            {
+                Some(id)
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether a type is a scalar (`bit<W>`, `int<W>`, `int`, `bool`).
+    fn scalar(&self, t: &Ty) -> bool {
+        matches!(
+            self.s.resolve_alias(t),
+            Ty::Bits { width: Some(_), .. } | Ty::Int | Ty::Bool
+        )
+    }
+
+    fn check_condition(&mut self, t: &Ty, cond: &Expr) {
+        if self.not_bool(t) {
+            let msg = format!(
+                "condition must be `bool`, found `{}`",
+                self.show_ty(t)
+            );
+            self.report(Diagnostic::error(cond.span, msg).with_code("type"));
+        }
+    }
+
+    /// Check that `value` (the expression `e`) may be stored in a place of
+    /// type `target` without a cast.
+    fn check_assign(&mut self, target: &Ty, value: &Ty, e: &Expr) {
+        let (t, v) =
+            (self.s.resolve_alias(target), self.s.resolve_alias(value));
+        let mismatch = match (&t, &v) {
+            _ if matches!(e.kind, ExprKind::DontCare) => false,
+            (Ty::Bits { .. }, Ty::Bits { .. }) => {
+                matches!((self.bits(&t), self.bits(&v)), (Some(a), Some(b)) if a != b)
+            }
+            (Ty::Bits { width: Some(_), .. }, Ty::Bool) => true,
+            (Ty::Def(..), Ty::Def(..))
+                if self.data_type(&t).is_some()
+                    && self.data_type(&v).is_some()
+                    && self.data_type(&t) != self.data_type(&v) =>
+            {
+                true
+            }
+            _ if (self.data_type(&t).is_some() && self.scalar(&v))
+                || (self.scalar(&t) && self.data_type(&v).is_some()) =>
+            {
+                true
+            }
+            (Ty::Bool, Ty::Bits { width: Some(_), .. } | Ty::Int) => true,
+            (
+                Ty::Bits {
+                    signed: false,
+                    width: Some(w),
+                },
+                Ty::Int,
+            ) => {
+                if let ExprKind::Int(IntLit {
+                    value: Some(n),
+                    width: None,
+                    ..
+                }) = &e.kind
+                {
+                    if *w < 128 && *n >> *w != 0 {
+                        let msg = format!(
+                            "`{}` does not fit in `bit<{w}>` and is truncated",
+                            self.text(e.span)
+                        );
+                        self.report(
+                            Diagnostic::warning(e.span, msg)
+                                .with_code("overflow"),
+                        );
+                    }
+                }
+                false
+            }
+            _ => false,
+        };
+        if !mismatch {
+            return;
+        }
+        let expected = self.show_ty(&t);
+        let msg = format!(
+            "mismatched types: expected `{expected}`, found `{}`",
+            self.show_ty(&v)
+        );
+        let code = if self.bits(&t).is_some() && self.bits(&v).is_some() {
+            "width"
+        } else {
+            "type"
+        };
+        self.report(Diagnostic::error(e.span, msg).with_code(code));
+        if !self.quiet && self.bits(&t).is_some() {
+            let compound = !matches!(
+                e.kind,
+                ExprKind::Path(_)
+                    | ExprKind::Member { .. }
+                    | ExprKind::Index { .. }
+                    | ExprKind::Slice { .. }
+                    | ExprKind::Int(_)
+                    | ExprKind::Call { .. }
+                    | ExprKind::Cast { .. }
+            );
+            self.s.mismatches.push(Mismatch {
+                span: e.span,
+                expected,
+                compound,
+            });
+        }
+    }
+
+    /// The declaration an l-value is rooted at (`hdr` in `hdr.a[1].b`), or
+    /// `Err(())` if the expression is certainly not assignable.
+    fn lvalue_root(&self, e: &Expr) -> Result<Option<DefId>, ()> {
+        let mut base = e;
+        loop {
+            match &base.kind {
+                ExprKind::Member { base: b, .. }
+                | ExprKind::Index { base: b, .. }
+                | ExprKind::Slice { base: b, .. }
+                | ExprKind::PlusSlice { base: b, .. } => base = b,
+                ExprKind::Path(p) => {
+                    let def = self
+                        .s
+                        .refs
+                        .iter()
+                        .rev()
+                        .find(|r| r.span == p.name.span)
+                        .map(|r| r.def);
+                    return Ok(def);
+                }
+                ExprKind::Int(_)
+                | ExprKind::Bool(_)
+                | ExprKind::Str(_)
+                | ExprKind::Binary { .. }
+                | ExprKind::Unary { .. }
+                | ExprKind::Cast { .. }
+                | ExprKind::Ternary { .. }
+                    if std::ptr::eq(base, e) =>
+                {
+                    return Err(())
+                }
+                _ => return Ok(None),
+            }
+        }
+    }
+
+    /// `packet_in.extract` takes a header and `packet_out.emit` a header,
+    /// header union, struct, or stack of them.
+    fn check_packet_call(
+        &mut self,
+        callee: DefId,
+        args: &[Argument],
+        tys: &[Ty],
+    ) {
+        let def = self.s.def(callee);
+        let ext = def.parent.map(|p| self.s.def(p).name.as_str());
+        let method = def.name.as_str();
+        let extract = method == "extract" && ext == Some("packet_in");
+        if !(extract || method == "emit" && ext == Some("packet_out")) {
+            return;
+        }
+        let (Some(a), Some(ty)) = (args.first(), tys.first()) else {
+            return;
+        };
+        let ty = self.s.resolve_alias(ty);
+        let kind = self.s.type_def(&ty).map(|d| self.s.def(d).kind);
+        let bad = if extract {
+            matches!(ty, Ty::Stack(..))
+                || matches!(
+                    kind,
+                    Some(SymbolKind::Struct | SymbolKind::HeaderUnion)
+                )
+        } else {
+            false
+        } || self.scalar(&ty)
+            || matches!(ty, Ty::String | Ty::Varbit(_));
+        if !bad {
+            return;
+        }
+        let found = match (&ty, kind) {
+            (Ty::Stack(..), _) => "a header stack".to_string(),
+            (_, Some(SymbolKind::Struct)) => {
+                format!("struct `{}`", self.show_ty(&ty))
+            }
+            (_, Some(SymbolKind::HeaderUnion)) => {
+                format!("header union `{}`", self.show_ty(&ty))
+            }
+            _ => format!("`{}`", self.show_ty(&ty)),
+        };
+        let msg = if extract {
+            let hint = if matches!(ty, Ty::Stack(..)) {
+                " (use `.next` to extract into a stack)"
+            } else {
+                ""
+            };
+            format!("`extract` expects a header, found {found}{hint}")
+        } else {
+            format!(
+                "`emit` expects a header, header union, struct, or header stack, found {found}"
+            )
+        };
+        self.report(Diagnostic::error(a.value.span, msg).with_code("type"));
+    }
+
+    /// Every action and function named `name` in the enclosing scopes.
+    fn visible_callables(&self, name: &str) -> Vec<DefId> {
+        let mut out = Vec::new();
+        let mut cur = Some(self.scope);
+        while let Some(id) = cur {
+            let scope = &self.s.scopes[id.0 as usize];
+            if let Some(defs) = scope.names.get(name) {
+                out.extend(defs.iter().copied().filter(|&d| {
+                    matches!(
+                        self.s.def(d).kind,
+                        SymbolKind::Action | SymbolKind::Function
+                    )
+                }));
+            }
+            cur = scope.parent;
+        }
+        out
+    }
+
+    /// Why a declaration cannot be written, if it cannot.
+    fn read_only(&self, d: DefId) -> Option<String> {
+        let def = self.s.def(d);
+        match def.kind {
+            SymbolKind::Constant => {
+                Some(format!("`{}` is a constant", def.name))
+            }
+            SymbolKind::Parameter => match self.s.directions.get(&d)? {
+                Direction::In => {
+                    Some(format!("`{}` is an `in` parameter", def.name))
+                }
+                Direction::None => {
+                    Some(format!("`{}` is a directionless parameter", def.name))
+                }
+                Direction::Out | Direction::InOut => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Report an assignment to a constant or read-only parameter.
+    fn check_writable(&mut self, lhs: &Expr) {
+        let Ok(Some(d)) = self.lvalue_root(lhs) else {
+            return;
+        };
+        if let Some(why) = self.read_only(d) {
+            let mut diag = Diagnostic::error(
+                lhs.span,
+                format!("cannot assign to `{}`: {why}", self.text(lhs.span)),
+            )
+            .with_code("read-only");
+            if let Some(n) = self.s.def(d).name_span {
+                diag = diag.with_related(n, "declared here");
+            }
+            self.report(diag);
+        }
+    }
+
+    /// Check a call to an action, function, or method: the argument count,
+    /// and for the one matching declaration, argument types and that `out`
+    /// and `inout` arguments are assignable.
+    fn check_call(
+        &mut self,
+        callee: &Expr,
+        all: &[DefId],
+        args: &[Argument],
+        arg_tys: &[Ty],
+    ) {
+        let checkable = !all.is_empty()
+            && all.iter().all(|&d| {
+                let def = self.s.def(d);
+                def.name_span.is_some()
+                    && matches!(
+                        def.kind,
+                        SymbolKind::Action
+                            | SymbolKind::Function
+                            | SymbolKind::Method
+                    )
+            });
+        if !checkable {
+            return;
+        }
+        let n = args.len();
+        let fitting: Vec<DefId> = all
+            .iter()
+            .copied()
+            .filter(|&d| {
+                let def = self.s.def(d);
+                def.required_params <= n && n <= def.params.len()
+            })
+            .collect();
+        let name = self.s.def(all[0]).name.clone();
+        // A name may shadow another callable of the same name (an action
+        // `hash` calling the extern function `hash`).
+        let shadowed = matches!(callee.kind, ExprKind::Path(_))
+            && self.visible_callables(&name).iter().any(|&d| {
+                let def = self.s.def(d);
+                !all.contains(&d)
+                    && def.required_params <= n
+                    && n <= def.params.len()
+            });
+        if fitting.is_empty() && !shadowed {
+            let mut counts: Vec<String> = all
+                .iter()
+                .map(|&d| {
+                    let def = self.s.def(d);
+                    if def.required_params == def.params.len() {
+                        def.params.len().to_string()
+                    } else {
+                        format!(
+                            "{} to {}",
+                            def.required_params,
+                            def.params.len()
+                        )
+                    }
+                })
+                .collect();
+            counts.sort();
+            counts.dedup();
+            let plural = |c: &str| if c == "1" { "" } else { "s" };
+            let expected = match counts.as_slice() {
+                [one] => format!("{one} argument{}", plural(one)),
+                many => format!("{} arguments", many.join(" or ")),
+            };
+            let msg = format!(
+                "`{name}` takes {expected} but {n} {} given",
+                if n == 1 { "was" } else { "were" }
+            );
+            let mut diag =
+                Diagnostic::error(callee.span, msg).with_code("arguments");
+            if let Some(span) = self.s.def(all[0]).name_span {
+                diag = diag.with_related(span, "declared here");
+            }
+            self.report(diag);
+            return;
+        }
+        let [callee_def] = fitting[..] else { return };
+        if shadowed {
+            return;
+        }
+        self.check_packet_call(callee_def, args, arg_tys);
+        let params = self.s.def(callee_def).params.clone();
+        for (i, (a, ty)) in args.iter().zip(arg_tys).enumerate() {
+            let param = match &a.name {
+                Some(nm) => params
+                    .iter()
+                    .copied()
+                    .find(|&p| self.s.def(p).name == nm.text),
+                None if args.iter().all(|a| a.name.is_none()) => {
+                    params.get(i).copied()
+                }
+                None => None,
+            };
+            let Some(p) = param else { continue };
+            let pty = self.s.def(p).ty.clone();
+            let dir = self.s.directions.get(&p).copied();
+            if matches!(dir, Some(Direction::Out | Direction::InOut))
+                && !matches!(a.value.kind, ExprKind::DontCare)
+            {
+                let pname = self.s.def(p).name.clone();
+                let what = if dir == Some(Direction::Out) {
+                    "out"
+                } else {
+                    "inout"
+                };
+                match self.lvalue_root(&a.value) {
+                    Err(()) => {
+                        let msg = format!(
+                            "argument for `{what}` parameter `{pname}` must be assignable"
+                        );
+                        self.report(
+                            Diagnostic::error(a.value.span, msg)
+                                .with_code("read-only"),
+                        );
+                        continue;
+                    }
+                    Ok(Some(d)) => {
+                        if let Some(why) = self.read_only(d) {
+                            let msg = format!(
+                                "argument for `{what}` parameter `{pname}` must be assignable: {why}"
+                            );
+                            self.report(
+                                Diagnostic::error(a.value.span, msg)
+                                    .with_code("read-only"),
+                            );
+                            continue;
+                        }
+                    }
+                    Ok(None) => {}
+                }
+            }
+            self.check_assign(&pty, ty, &a.value);
         }
     }
 
@@ -2009,7 +2531,8 @@ impl Resolver<'_> {
         }
     }
 
-    fn args(&mut self, args: &[Argument], callees: &[DefId]) {
+    fn args(&mut self, args: &[Argument], callees: &[DefId]) -> Vec<Ty> {
+        let mut tys = Vec::with_capacity(args.len());
         for a in args {
             if let Some(name) = &a.name {
                 let param = callees.iter().find_map(|&c| {
@@ -2024,8 +2547,9 @@ impl Resolver<'_> {
                     self.add_ref(name.span, p, false);
                 }
             }
-            self.expr(&a.value);
+            tys.push(self.expr(&a.value));
         }
+        tys
     }
 
     fn call_site(
@@ -2134,13 +2658,32 @@ impl Resolver<'_> {
                 self.expr(base);
                 self.expr(hi);
                 self.expr(lo);
-                (Ty::Base, Vec::new())
+                let width = match (self.const_eval(hi), self.const_eval(lo)) {
+                    (Some(h), Some(l)) if h >= l => {
+                        u32::try_from(h - l + 1).ok()
+                    }
+                    _ => None,
+                };
+                (
+                    Ty::Bits {
+                        signed: false,
+                        width,
+                    },
+                    Vec::new(),
+                )
             }
             ExprKind::PlusSlice { base, start, width } => {
                 self.expr(base);
                 self.expr(start);
                 self.expr(width);
-                (Ty::Base, Vec::new())
+                let width = self.const_u32(width);
+                (
+                    Ty::Bits {
+                        signed: false,
+                        width,
+                    },
+                    Vec::new(),
+                )
             }
             ExprKind::Call {
                 callee,
@@ -2159,7 +2702,8 @@ impl Resolver<'_> {
                 // Signature help offers every overload; navigation uses the
                 // one matching the argument count.
                 self.call_site(span, all.clone(), args);
-                let candidates = pick_overloads(&self.s, all, args.len());
+                let candidates =
+                    pick_overloads(&self.s, all.clone(), args.len());
                 if let (Some(&best), Some(name)) =
                     (candidates.first(), callee_name_span(callee))
                 {
@@ -2173,7 +2717,8 @@ impl Resolver<'_> {
                         }
                     }
                 }
-                self.args(args, &candidates);
+                let arg_tys = self.args(args, &candidates);
+                self.check_call(callee, &all, args, &arg_tys);
                 let ty = match candidates.first() {
                     Some(&c) => {
                         let def = self.s.def(c);
@@ -2188,7 +2733,9 @@ impl Resolver<'_> {
                                 let ty = def.ty.clone();
                                 // Extern method return types are already
                                 // substituted by `members_of`.
-                                let ty = if def.kind == SymbolKind::Method {
+                                let ty = if def.kind == SymbolKind::Method
+                                    && def.name_span.is_some()
+                                {
                                     callee_ret_ty(&callee_ty, &ty)
                                 } else {
                                     ty
@@ -2223,20 +2770,39 @@ impl Resolver<'_> {
                 self.expr(expr);
                 (t, Vec::new())
             }
-            ExprKind::Unary { expr, .. } => {
-                self.expr(expr);
-                (Ty::Base, Vec::new())
+            ExprKind::Unary { op, expr } => {
+                let t = self.expr(expr);
+                let ty = match op {
+                    UnOp::Not => Ty::Bool,
+                    _ => match self.s.resolve_alias(&t) {
+                        t @ (Ty::Bits { .. } | Ty::Int) => t,
+                        _ => Ty::Unknown,
+                    },
+                };
+                (ty, Vec::new())
             }
-            ExprKind::Binary { lhs, rhs, .. } => {
-                self.expr(lhs);
-                self.expr(rhs);
-                (Ty::Base, Vec::new())
+            ExprKind::Binary { op, lhs, rhs } => {
+                let l = self.expr(lhs);
+                let r = self.expr(rhs);
+                (self.binary_ty(*op, &l, &r, e), Vec::new())
             }
             ExprKind::Ternary { cond, then, els } => {
-                self.expr(cond);
+                let c = self.expr(cond);
+                self.check_condition(&c, cond);
                 let t = self.expr(then);
-                self.expr(els);
-                (t, Vec::new())
+                let f = self.expr(els);
+                let t = self.s.resolve_alias(&t);
+                let f = self.s.resolve_alias(&f);
+                let ty = if t == f
+                    || (f == Ty::Int && matches!(t, Ty::Bits { .. }))
+                {
+                    t
+                } else if t == Ty::Int && matches!(f, Ty::Bits { .. }) {
+                    f
+                } else {
+                    Ty::Unknown
+                };
+                (ty, Vec::new())
             }
             ExprKind::List(es) => {
                 let ts = es.iter().map(|e| self.expr(e)).collect();
@@ -2253,6 +2819,77 @@ impl Resolver<'_> {
             | ExprKind::This
             | ExprKind::DontCare
             | ExprKind::Error => (Ty::Unknown, Vec::new()),
+        }
+    }
+
+    /// The type of a binary expression, reporting operands of different
+    /// fixed widths.
+    fn binary_ty(&mut self, op: BinOp, l: &Ty, r: &Ty, e: &Expr) -> Ty {
+        let (l, r) = (self.s.resolve_alias(l), self.s.resolve_alias(r));
+        let bits = |t: &Ty| matches!(t, Ty::Bits { .. });
+        // Operands of arithmetic, bitwise, and comparison operators must
+        // have the same type, with unsized integers adapting.
+        let same = || {
+            if l == r {
+                Some(l.clone())
+            } else if l == Ty::Int && bits(&r) {
+                Some(r.clone())
+            } else if r == Ty::Int && bits(&l) {
+                Some(l.clone())
+            } else {
+                None
+            }
+        };
+        let check = |s: &mut Self| {
+            if let (Some(a), Some(b)) = (s.bits(&l), s.bits(&r)) {
+                if a != b {
+                    let msg = format!(
+                        "mismatched operand types: `{}` and `{}`",
+                        s.show_ty(&l),
+                        s.show_ty(&r)
+                    );
+                    s.report(Diagnostic::error(e.span, msg).with_code("width"));
+                }
+            }
+        };
+        match op {
+            BinOp::Add
+            | BinOp::Sub
+            | BinOp::Mul
+            | BinOp::Div
+            | BinOp::Mod
+            | BinOp::AddSat
+            | BinOp::SubSat
+            | BinOp::BitAnd
+            | BinOp::BitOr
+            | BinOp::BitXor => {
+                check(self);
+                same()
+                    .filter(|t| bits(t) || *t == Ty::Int)
+                    .unwrap_or(Ty::Unknown)
+            }
+            BinOp::Eq
+            | BinOp::Ne
+            | BinOp::Lt
+            | BinOp::Le
+            | BinOp::Gt
+            | BinOp::Ge => {
+                check(self);
+                Ty::Bool
+            }
+            BinOp::And | BinOp::Or => Ty::Bool,
+            BinOp::Shl | BinOp::Shr => match l {
+                Ty::Bits { .. } | Ty::Int => l,
+                _ => Ty::Unknown,
+            },
+            BinOp::Concat => match (self.bits(&l), self.bits(&r)) {
+                (Some((signed, a)), Some((_, b))) => Ty::Bits {
+                    signed,
+                    width: a.checked_add(b),
+                },
+                _ => Ty::Unknown,
+            },
+            BinOp::Range => Ty::Unknown,
         }
     }
 

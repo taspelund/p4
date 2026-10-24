@@ -9,7 +9,18 @@ Features:
   `#error`, unbalanced conditionals), syntax errors with recovery, and name
   resolution (unknown names, states, match kinds, and struct/header
   members; duplicate declarations; actions a table uses as its default or
-  in entries but does not list in `actions`). Code skipped by
+  in entries but does not list in `actions`), and type errors: fixed-width
+  values of a different width or signedness than expected (in
+  assignments, initializers, arguments, and operands), non-`bool`
+  conditions, assignments to constants and `in` or directionless
+  parameters, unassignable `out`/`inout` arguments, wrong argument
+  counts, integer literals too wide for their `bit<W>` (a warning),
+  `select` cases and table `entries` whose values do not match the keys'
+  types or count, assignments between different structs and headers,
+  and `extract`/`emit` of values that are not headers.
+  Types that are generic or not fully known are never reported. x4c
+  converts between widths implicitly, so for programs using its `SoftNPU`
+  package width mismatches are warnings. Code skipped by
   `#if`/`#ifdef`, and unused local declarations in controls, parsers,
   actions, and functions, are reported as faded "unnecessary" hints.
 - Go to definition, declaration, and type definition, including through
@@ -40,7 +51,8 @@ Features:
   - Quick fixes: change a misspelled name, member, state, or match kind to
     a similar one in scope; create a missing action (parameters guessed from
     the call) or parser state; add the `#include` for a header that
-    declares an unknown name; insert a missing `;`; add an action to a
+    declares an unknown name; cast a value to the expected width; insert
+    a missing `;`; add an action to a
     table's `actions`; remove an unused declaration.
   - Generate: the missing cases of a `switch (t.apply().action_run)`;
     `emit` calls in a deparser for each header field; parser states for

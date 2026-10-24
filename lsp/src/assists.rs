@@ -22,6 +22,7 @@ pub fn code_actions(
     };
     let mut out = Vec::new();
     cx.unresolved_fixes(&mut out);
+    cx.cast_fix(&mut out);
     cx.missing_semicolon(&mut out);
     cx.not_in_actions(&mut out);
     cx.remove_unused(&mut out);
@@ -46,6 +47,32 @@ struct Cx<'a> {
 }
 
 impl<'a> Cx<'a> {
+    /// Cast a value of the wrong width or signedness to the expected type.
+    fn cast_fix(&self, out: &mut Vec<CodeAction>) {
+        for m in &self.a.sema.mismatches {
+            if m.span.file != self.file
+                || !(m.span.start <= self.end && self.start <= m.span.end)
+                || out.iter().any(|a| a.fixes == Some(m.span))
+            {
+                continue;
+            }
+            let at = |o: u32| Span::new(m.span.file, o, o);
+            let mut edits =
+                vec![(at(m.span.start), format!("({})", m.expected))];
+            if m.compound {
+                edits[0].1.push('(');
+                edits.push((at(m.span.end), ")".into()));
+            }
+            out.push(CodeAction {
+                title: format!("Cast to `{}`", m.expected),
+                kind: CodeActionKind::QuickFix,
+                edits,
+                fixes: Some(m.span),
+                preferred: true,
+            });
+        }
+    }
+
     fn text(&self, file: FileId) -> &str {
         self.a.db.text(file)
     }

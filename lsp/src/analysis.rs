@@ -345,7 +345,21 @@ impl Analysis {
             .cloned()
             .collect();
         diagnostics.extend(parse.diagnostics.iter().cloned());
-        diagnostics.extend(sema.diagnostics.iter().cloned());
+        // x4c widens and truncates between fixed widths implicitly, so for
+        // programs using its `SoftNPU` package width mismatches are only
+        // warnings.
+        let x4c = sema.refs.iter().any(|r| {
+            let d = sema.def(r.def);
+            d.kind == SymbolKind::Package && d.name == "SoftNPU"
+        });
+        diagnostics.extend(sema.diagnostics.iter().cloned().map(|mut d| {
+            if x4c && d.code == Some("width") {
+                d.severity = Severity::Warning;
+                d.message
+                    .push_str(" (x4c converts implicitly; p4c rejects this)");
+            }
+            d
+        }));
         for &span in &pp.inactive {
             let mut d = Diagnostic::new(
                 span,
