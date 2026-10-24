@@ -3047,7 +3047,7 @@ fn opener(close: K) -> &'static str {
 }
 
 /// Parses an integer literal such as `42`, `0x2A`, `8w0b101`, or `16s-`.
-fn parse_int(text: &str) -> Option<IntLit> {
+pub fn parse_int(text: &str) -> Option<IntLit> {
     let bytes = text.as_bytes();
     let digits = bytes.iter().take_while(|b| b.is_ascii_digit()).count();
     let (width, signed, rest) = match bytes.get(digits) {

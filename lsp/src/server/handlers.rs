@@ -280,9 +280,25 @@ impl Server<'_> {
             return Ok(None);
         };
         let a = self.analysis(&t);
+        let snippets = self.caps.snippets;
+        // `<`, `"`, and `/` trigger completion only for `#include` paths.
+        let paths_only = p
+            .context
+            .as_ref()
+            .and_then(|c| c.trigger_character.as_deref())
+            .is_some_and(|c| c != ".");
         let items = a
             .completions(t.file, offset)
             .into_iter()
+            .filter(|c| snippets || c.kind != analysis::SymbolKind::Snippet)
+            .filter(|c| {
+                !paths_only
+                    || matches!(
+                        c.kind,
+                        analysis::SymbolKind::File
+                            | analysis::SymbolKind::Folder
+                    )
+            })
             .enumerate()
             // Keep the analysis's order (fields in declaration order, inner
             // scopes first) when the client sorts by `sortText`.
@@ -298,6 +314,18 @@ impl Server<'_> {
                             .collect()
                     },
                 ),
+                insert_text_format: (c.snippet && snippets)
+                    .then_some(InsertTextFormat::SNIPPET),
+                text_edit: match (c.replace, &c.insert) {
+                    (Some(span), Some(text)) => Some(CompletionTextEdit::Edit(
+                        TextEdit::new(self.range(&a.db, span), text.clone()),
+                    )),
+                    _ => None,
+                },
+                insert_text: c.insert.filter(|_| {
+                    c.replace.is_none() && (snippets || !c.snippet)
+                }),
+                filter_text: c.replace.is_some().then(|| c.label.clone()),
                 label: c.label,
                 kind: Some(completion_kind(c.kind)),
                 detail: c.detail,
@@ -481,11 +509,14 @@ impl Server<'_> {
             .map(|h| InlayHint {
                 position: self.position(&a.db, h.file, h.offset),
                 label: InlayHintLabel::String(h.label),
-                kind: None,
+                kind: (h.kind == analysis::InlayHintKind::Parameter)
+                    .then_some(InlayHintKind::PARAMETER),
                 text_edits: None,
                 tooltip: None,
-                padding_left: None,
-                padding_right: None,
+                padding_left: Some(h.kind == analysis::InlayHintKind::Closing),
+                padding_right: Some(
+                    h.kind == analysis::InlayHintKind::Parameter,
+                ),
                 data: None,
             })
             .collect();
@@ -521,7 +552,8 @@ pub fn symbol_kind(kind: analysis::SymbolKind) -> SymbolKind {
         K::State => SymbolKind::EVENT,
         K::Package => SymbolKind::PACKAGE,
         K::ValueSet => SymbolKind::ARRAY,
-        K::Keyword => SymbolKind::KEY,
+        K::Keyword | K::Snippet => SymbolKind::KEY,
+        K::File | K::Folder => SymbolKind::FILE,
     }
 }
 
@@ -546,6 +578,9 @@ pub fn completion_kind(kind: analysis::SymbolKind) -> CompletionItemKind {
         K::Control | K::Parser | K::Package => CompletionItemKind::MODULE,
         K::State => CompletionItemKind::EVENT,
         K::Keyword => CompletionItemKind::KEYWORD,
+        K::Snippet => CompletionItemKind::SNIPPET,
+        K::File => CompletionItemKind::FILE,
+        K::Folder => CompletionItemKind::FOLDER,
     }
 }
 

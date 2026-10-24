@@ -91,6 +91,9 @@ pub struct Output {
     /// after the controlling directive to the end of the line before the
     /// next directive at the same level.
     pub inactive: Vec<Span>,
+    /// Each `#elif`, `#else`, and `#endif` (also in inactive code) with the
+    /// opening `#if`, `#ifdef`, or `#ifndef` directive it belongs to.
+    pub conditionals: Vec<(Span, Span)>,
     /// Comment spans per loaded file, from the lexer.
     pub comments: HashMap<FileId, Vec<Span>>,
     pub diagnostics: Vec<Diagnostic>,
@@ -354,6 +357,7 @@ impl Pp<'_> {
                     return;
                 }
                 let c = self.conds.last().unwrap();
+                self.out.conditionals.push((dir_span, c.dir));
                 let (seen_else, parent_active, taken, cur_active) =
                     (c.seen_else, c.parent_active, c.taken, c.active);
                 if seen_else {
@@ -392,6 +396,7 @@ impl Pp<'_> {
                     return;
                 }
                 let c = self.conds.pop().unwrap();
+                self.out.conditionals.push((dir_span, c.dir));
                 if let Some(from) = c.inactive_from {
                     let end = self.line_before(file, hash.span.start);
                     self.push_inactive(file, from, end);

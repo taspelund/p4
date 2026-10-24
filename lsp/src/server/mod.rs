@@ -112,6 +112,7 @@ struct ClientCaps {
     hierarchical_symbols: bool,
     related_information: bool,
     watch_files: bool,
+    snippets: bool,
 }
 
 /// The last diagnostics published for one file.
@@ -194,7 +195,12 @@ impl<'a> Server<'a> {
             document_symbol_provider: Some(OneOf::Left(true)),
             workspace_symbol_provider: Some(OneOf::Left(true)),
             completion_provider: Some(CompletionOptions {
-                trigger_characters: Some(vec![".".into()]),
+                trigger_characters: Some(vec![
+                    ".".into(),
+                    "<".into(),
+                    "\"".into(),
+                    "/".into(),
+                ]),
                 resolve_provider: Some(false),
                 ..Default::default()
             }),
@@ -215,6 +221,7 @@ impl<'a> Server<'a> {
                     work_done_progress_options: Default::default(),
                 },
             )),
+            inlay_hint_provider: Some(OneOf::Left(true)),
             rename_provider: Some(OneOf::Right(RenameOptions {
                 prepare_provider: Some(true),
                 work_done_progress_options: Default::default(),
@@ -889,6 +896,11 @@ fn client_caps(caps: &ClientCapabilities) -> ClientCaps {
             .as_ref()
             .and_then(|w| w.did_change_watched_files.as_ref())
             .and_then(|d| d.dynamic_registration)
+            .unwrap_or(false),
+        snippets: text
+            .and_then(|t| t.completion.as_ref())
+            .and_then(|c| c.completion_item.as_ref())
+            .and_then(|i| i.snippet_support)
             .unwrap_or(false),
     }
 }

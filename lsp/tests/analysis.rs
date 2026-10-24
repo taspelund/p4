@@ -334,7 +334,8 @@ control c(inout headers_t hdr) {
     let h = f.a.hover(file, off).unwrap();
     assert_eq!(
         h.markdown,
-        "```p4\nttl_t ttl\n```\n\nin `header ipv4_h`\n\n---\n\ntime to live"
+        "```p4\nttl_t ttl\n```\n\nin `header ipv4_h`\n\n\
+         8 bits (1 byte), bits 0..7 of `ipv4_h`, byte 0\n\n---\n\ntime to live"
     );
 }
 
@@ -959,4 +960,228 @@ fn completion_after_multibyte_chars() {
         f.a.completions(file, o);
         f.a.signature_help(file, o);
     }
+}
+
+#[test]
+fn hover_layouts_constants_literals_and_macro_expansions() {
+    let f = fixture(&[(
+        "main.p4",
+        "typedef bit<24> vni_t;
+enum bit<2> color_t { RED = 0, BLUE = 1 }
+const bit<16> ETH$0TYPE = 0x0800;
+const int SI$4ZE = 4 * 256;
+#define SHIFT(x) ((x) << 2)
+header geneve_h {
+    bit<2> version;
+    bit<1> c$1rit;
+    color_t color;
+    bit<3> reserved;
+    vni_t v$2ni;
+    bit<8> pad;
+}
+header var_h { bit<8> len; varbit<64> opts; bit<8> after; }
+struct pair_t { bit<8> a; bool b; }
+control c(inout geneve_h h) {
+    apply { h.pad = (bit<8>)SH$3IFT(SIZE) + 8w2$55; }
+}
+",
+    )]);
+    let hover = |m: &str| {
+        let (file, off) = f.at(m);
+        f.a.hover(file, off).map(|h| h.markdown).unwrap_or_default()
+    };
+    // The declared width pads hex and binary.
+    assert!(
+        hover("0").ends_with("value: 2048 · 0x0800 · 0b0000_1000_0000_0000"),
+        "{}",
+        hover("0")
+    );
+    // Constants computed from constants have values too.
+    assert!(
+        hover("4").ends_with("value: 1024 · 0x400 · 0b100_0000_0000"),
+        "{}",
+        hover("4")
+    );
+    // Single-bit fields, enum fields (through their representation), and
+    // typedefs all count toward offsets.
+    assert!(
+        hover("1").contains("1 bit, bit 2 of `geneve_h`"),
+        "{}",
+        hover("1")
+    );
+    assert!(
+        hover("2")
+            .contains("24 bits (3 bytes), bits 8..31 of `geneve_h`, byte 1"),
+        "{}",
+        hover("2")
+    );
+    let file = f.at("0").0;
+    let text = f.a.db.text(file);
+    let header = |name: &str| {
+        let o = text.find(name).unwrap() as u32;
+        f.a.hover(file, o).unwrap().markdown
+    };
+    let geneve = header("geneve_h {");
+    assert!(geneve.contains("size: 40 bits (5 bytes)"), "{geneve}");
+    assert!(
+        geneve.contains(
+            "bits    width  field\n0..1        2  version\n2           1  crit\n\
+             3..4        2  color\n5..7        3  reserved\n\
+             8..31      24  vni\n32..39      8  pad\n"
+        ),
+        "{geneve}"
+    );
+    // Offsets after a varbit are unknown, and the size is a minimum.
+    let var = header("var_h");
+    assert!(var.contains("size: at least 16 bits"), "{var}");
+    assert!(
+        var.contains("8..     var  opts\n?         8  after"),
+        "{var}"
+    );
+    assert!(header("pair_t").contains("size: 9 bits\n"));
+    // Function-like macros show their expansion at the use.
+    assert!(
+        hover("3").contains("expands to\n```p4\n((SIZE) << 2)\n```"),
+        "{}",
+        hover("3")
+    );
+    assert_eq!(hover("5"), "25 · 0x19 · 0b0001_1001");
+}
+
+#[test]
+fn parameter_and_closing_inlay_hints() {
+    let body = "        x = x;\n".repeat(15);
+    let text = format!(
+        "#define FLAG
+extern void send(in bit<9> port, in bit<8> reason);
+action set_port(bit<9> port) {{ }}
+control c(inout bit<9> port, inout bit<8> x) {{
+    action fwd(bit<9> egress_port, bit<8> code) {{ }}
+    apply {{
+        send(port, 7);
+        fwd(9, code = 1);
+        set_port(3);
+        fwd(egress_port = 1, code = 2);
+#ifdef FLAG
+{body}#endif
+    }}
+}}
+"
+    );
+    let f = fixture(&[("main.p4", &text)]);
+    let file = f.a.root;
+    let text = f.a.db.text(file);
+    let shown: Vec<String> =
+        f.a.inlay_hints(file, 0, text.len() as u32)
+            .into_iter()
+            .map(|h| {
+                let line = text[..h.offset as usize].matches('\n').count() + 1;
+                format!("{line}:{}", h.label)
+            })
+            .collect();
+    // `port` repeats the argument, `set_port(3)` names its sole parameter,
+    // and named arguments already say it. Short blocks get no closing hint.
+    assert_eq!(
+        shown,
+        [
+            "7:reason:",
+            "8:egress_port:",
+            "27:#ifdef FLAG",
+            "29:control c"
+        ]
+    );
+}
+
+#[test]
+fn snippets_and_include_paths() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(dir.join("inc/tofino")).unwrap();
+    std::fs::write(dir.join("inc/core.p4"), CORE).unwrap();
+    std::fs::write(dir.join("inc/tna.p4"), "").unwrap();
+    std::fs::write(dir.join("inc/notes.txt"), "").unwrap();
+    std::fs::write(dir.join("inc/tofino/stratum.p4"), "").unwrap();
+    std::fs::write(dir.join("local.p4"), "").unwrap();
+    let main = "#include <core.p4>
+#include <t
+#include \"
+#include <tofino/s>
+extern E { E(); void m(in bit<8> a); void m(in bit<8> a, in bit<8> b); }
+control c(inout bit<8> v) {
+    E() e;
+    action fwd(bit<9> port, bit<8> code) { }
+    action drop() { }
+    table t { key = { v: exact; } actions = { f; } default_action = d; }
+    apply {
+        f;
+        e.m;
+        switch (t.apply().action_run) { f }
+    }
+}
+";
+    std::fs::write(dir.join("main.p4"), main).unwrap();
+    let opts = Options {
+        include_dirs: vec![dir.join("inc")],
+        defines: vec![],
+    };
+    let mut db = SourceDb::new(HashMap::new());
+    let root = db.load(&dir.join("main.p4")).unwrap();
+    let a = Analysis::new(db, root, &opts);
+    let at = |needle: &str| (main.find(needle).unwrap() + needle.len()) as u32;
+    let paths = |o: u32| {
+        a.completions(root, o)
+            .into_iter()
+            .map(|c| format!("{}={}", c.label, c.insert.unwrap_or_default()))
+            .collect::<Vec<_>>()
+    };
+    // Directories end in `/`; files get the closing delimiter unless the
+    // line has it; non-P4 files are not offered; quoted includes also
+    // search the including file's directory.
+    assert_eq!(
+        paths(at("<t")),
+        ["core.p4=core.p4>", "tna.p4=tna.p4>", "tofino/=tofino/"]
+    );
+    assert_eq!(
+        paths(at("#include \"")),
+        [
+            "inc/=inc/",
+            "local.p4=local.p4\"",
+            "core.p4=core.p4\"",
+            "tna.p4=tna.p4\"",
+            "tofino/=tofino/"
+        ]
+    );
+    assert_eq!(paths(at("<tofino/s")), ["stratum.p4=stratum.p4"]);
+    let item = |o: u32, label: &str| {
+        a.completions(root, o)
+            .into_iter()
+            .find(|c| c.label == label)
+    };
+    // Calls get parameter placeholders, and overloads an empty argument
+    // list. Action lists and switch labels name actions without calling.
+    let call = item(at("        f"), "fwd").unwrap();
+    assert_eq!(call.insert.as_deref(), Some("fwd(${1:port}, ${2:code})$0"));
+    assert!(call.snippet);
+    assert_eq!(
+        item(at("        e.m"), "m").unwrap().insert.as_deref(),
+        Some("m($0)")
+    );
+    assert_eq!(item(at("actions = { f"), "fwd").unwrap().insert, None);
+    assert_eq!(item(at("action_run) { f"), "fwd").unwrap().insert, None);
+    assert_eq!(
+        item(at("default_action = d"), "drop")
+            .unwrap()
+            .insert
+            .as_deref(),
+        Some("drop()$0")
+    );
+    let table = a
+        .completions(root, at("        f"))
+        .into_iter()
+        .find(|c| c.label == "table" && c.snippet)
+        .unwrap();
+    assert!(table
+        .insert
+        .unwrap()
+        .starts_with("table ${1:name} {\n\tkey"));
 }

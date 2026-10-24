@@ -444,7 +444,7 @@ impl<'a> Cx<'a> {
                     let ty = sema.resolve_alias(&sema.def(f).ty);
                     let kind = sema.type_def(&ty).map(|d| sema.def(d).kind);
                     let header = kind == Some(SymbolKind::Header)
-                        && !matches!(ty, Ty::Stack(_));
+                        && !matches!(ty, Ty::Stack(..));
                     let emits = matches!(
                         kind,
                         Some(

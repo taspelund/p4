@@ -16,11 +16,23 @@ Features:
   `#include` paths and macro names. A fragment included in several places
   offers each declaration it resolves to.
 - Hover with the declaration, its container, and its doc comment (the
-  comment above it, or the one trailing it on the same line).
+  comment above it, or the one trailing it on the same line). Headers show
+  their size and each field's bit offsets; header fields their position;
+  constants their value; integer literals their value in decimal, hex, and
+  binary; and macro uses what they expand to.
 - Find references, document highlight (with writes marked), and rename.
 - Completion of members after `.` and of names in scope, with keywords and
   macros. Names declared in headers the program does not include yet are
-  offered too; accepting one adds the `#include` (auto-import).
+  offered too; accepting one adds the `#include` (auto-import). Actions,
+  functions, and methods complete as calls with parameter placeholders
+  (except where a table or `switch` names an action), and `table`,
+  `parser`, `control`, `state`, `transition select`, and other skeletons
+  are offered as snippets. In `#include` lines, paths complete from the
+  include directories.
+- Inlay hints: parameter names before call arguments (unless the argument
+  already says it), and labels after the closing `}` of long declarations
+  and after `#else`/`#endif` of long conditionals. In Helix, enable them
+  with `display-inlay-hints = true` under `[editor.lsp]`.
 - Signature help for actions, functions, extern methods and constructors,
   and parser/control `apply`, listing every overload.
 - Document symbols (nested) and workspace symbols.

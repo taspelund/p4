@@ -24,19 +24,30 @@ pub struct DefId(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ScopeId(pub u32);
 
-/// The type of a value or the meaning of a type expression, as far as
-/// member resolution needs it.
+/// The type of a value or the meaning of a type expression.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Ty {
     Unknown,
-    /// A type without members: `bit<N>`, `bool`, `string`, ...
+    /// Another type without members: `void`, `match_kind`, lists, ...
     Base,
+    /// `bit<W>`, or `int<W>` when signed. The width is `None` when it is not
+    /// a constant the analysis can evaluate.
+    Bits {
+        signed: bool,
+        width: Option<u32>,
+    },
+    /// `varbit<W>`.
+    Varbit(Option<u32>),
+    /// Arbitrary-precision `int`, the type of unsized integer literals.
+    Int,
+    Bool,
+    String,
     /// A declared type with type arguments: struct, header, header union,
     /// enum, extern, parser, control, package, typedef, type parameter, or
     /// table.
     Def(DefId, Vec<Ty>),
-    /// A header stack.
-    Stack(Box<Ty>),
+    /// A header stack and its size, if known.
+    Stack(Box<Ty>, Option<u32>),
     Tuple(Vec<Ty>),
     /// The `error` type.
     Error,
@@ -172,6 +183,8 @@ pub struct Sema {
     pub const_values: HashMap<DefId, u128>,
     /// Local declarations that are never referenced.
     pub unused: Vec<DefId>,
+    /// The underlying type of serializable enums (`enum bit<8> E { ... }`).
+    pub enum_reprs: HashMap<DefId, Ty>,
     builtins: HashMap<&'static str, DefId>,
 }
 
@@ -198,7 +211,7 @@ impl Sema {
     pub fn type_def(&self, ty: &Ty) -> Option<DefId> {
         match self.resolve_alias(ty) {
             Ty::Def(id, _) | Ty::TableApply(id) => Some(id),
-            Ty::Stack(elem) => self.type_def(&elem),
+            Ty::Stack(elem, _) => self.type_def(&elem),
             Ty::TypeName(t) => self.type_def(&t),
             _ => None,
         }
@@ -252,7 +265,7 @@ impl Sema {
                     _ => {}
                 }
             }
-            Ty::Stack(elem) => {
+            Ty::Stack(elem, _) => {
                 for n in ["next", "last"] {
                     out.push((b(n), (**elem).clone()));
                 }
@@ -298,7 +311,7 @@ impl Sema {
                     | SymbolKind::HeaderUnion
                     | SymbolKind::Table
             ),
-            Ty::Stack(_) | Ty::TableApply(_) => true,
+            Ty::Stack(..) | Ty::TableApply(_) => true,
             Ty::TypeName(t) => match self.resolve_alias(&t) {
                 Ty::Error => true,
                 Ty::Def(id, _) => self.def(id).kind == SymbolKind::Enum,
@@ -371,7 +384,7 @@ fn subst(ty: &Ty, env: &[(DefId, Ty)]) -> Ty {
             }
             Ty::Def(*id, args.iter().map(|a| subst(a, env)).collect())
         }
-        Ty::Stack(e) => Ty::Stack(Box::new(subst(e, env))),
+        Ty::Stack(e, n) => Ty::Stack(Box::new(subst(e, env)), *n),
         Ty::Tuple(ts) => Ty::Tuple(ts.iter().map(|t| subst(t, env)).collect()),
         t => t.clone(),
     }
@@ -1192,6 +1205,11 @@ impl Resolver<'_> {
                 self.expr(&c.value);
                 if let Some(id) = self.def_for(&c.name) {
                     self.s.defs[id.0 as usize].ty = ty;
+                    if let Some(v) = self.const_eval(&c.value) {
+                        if let Ok(v) = u128::try_from(v) {
+                            self.s.const_values.insert(id, v);
+                        }
+                    }
                 }
             }
             Decl::Var(v) => {
@@ -1231,7 +1249,8 @@ impl Resolver<'_> {
                     return;
                 };
                 if let Some(t) = &e.repr {
-                    self.resolve_type(t);
+                    let repr = self.resolve_type(t);
+                    self.s.enum_reprs.insert(id, repr);
                 }
                 // Member values may refer to earlier members by bare name.
                 self.with_scope(None, |r| {
@@ -1876,22 +1895,88 @@ impl Resolver<'_> {
         defs
     }
 
+    /// A compile-time constant expression's value (literals, constants,
+    /// and integer arithmetic on them), as P4 integers without widths.
+    fn const_eval(&self, e: &Expr) -> Option<i128> {
+        self.const_eval_depth(e, 0)
+    }
+
+    fn const_eval_depth(&self, e: &Expr, depth: u32) -> Option<i128> {
+        if depth > 64 {
+            return None;
+        }
+        let eval = |e: &Expr| self.const_eval_depth(e, depth + 1);
+        match &e.kind {
+            ExprKind::Int(lit) => {
+                lit.value.and_then(|v| i128::try_from(v).ok())
+            }
+            ExprKind::Path(p) => {
+                let d = *self
+                    .lookup(&p.name.text, Want::Value, p.global)
+                    .first()?;
+                let v = *self.s.const_values.get(&d)?;
+                i128::try_from(v).ok()
+            }
+            ExprKind::Cast { expr, .. } => eval(expr),
+            ExprKind::Unary { op, expr } => {
+                let v = eval(expr)?;
+                match op {
+                    UnOp::Neg => v.checked_neg(),
+                    UnOp::Plus => Some(v),
+                    _ => None,
+                }
+            }
+            ExprKind::Binary { op, lhs, rhs } => {
+                let (a, b) = (eval(lhs)?, eval(rhs)?);
+                match op {
+                    BinOp::Add => a.checked_add(b),
+                    BinOp::Sub => a.checked_sub(b),
+                    BinOp::Mul => a.checked_mul(b),
+                    BinOp::Div => a.checked_div(b),
+                    BinOp::Mod => a.checked_rem(b),
+                    BinOp::Shl => a.checked_shl(u32::try_from(b).ok()?),
+                    BinOp::Shr => a.checked_shr(u32::try_from(b).ok()?),
+                    BinOp::BitAnd => Some(a & b),
+                    BinOp::BitOr => Some(a | b),
+                    BinOp::BitXor => Some(a ^ b),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// A constant width or size.
+    fn const_u32(&self, e: &Expr) -> Option<u32> {
+        self.const_eval(e).and_then(|v| u32::try_from(v).ok())
+    }
+
     fn resolve_type(&mut self, t: &Type) -> Ty {
         match &t.kind {
             TypeKind::Bit(w) | TypeKind::Int(w) => {
-                if let Some(w) = w {
-                    self.expr(w);
+                let signed = matches!(t.kind, TypeKind::Int(_));
+                match w {
+                    Some(w) => {
+                        self.expr(w);
+                        Ty::Bits {
+                            signed,
+                            width: self.const_u32(w),
+                        }
+                    }
+                    None if signed => Ty::Int,
+                    None => Ty::Bits {
+                        signed,
+                        width: Some(1),
+                    },
                 }
-                Ty::Base
             }
             TypeKind::Varbit(w) => {
                 self.expr(w);
-                Ty::Base
+                Ty::Varbit(self.const_u32(w))
             }
-            TypeKind::Bool
-            | TypeKind::String
-            | TypeKind::Void
-            | TypeKind::MatchKind => Ty::Base,
+            TypeKind::Bool => Ty::Bool,
+            TypeKind::String => Ty::String,
+            TypeKind::Void | TypeKind::MatchKind => Ty::Base,
             TypeKind::ErrorType => Ty::Error,
             TypeKind::DontCare | TypeKind::Error => Ty::Unknown,
             TypeKind::Named { path, args } => {
@@ -1912,7 +1997,7 @@ impl Resolver<'_> {
             TypeKind::Stack { elem, size } => {
                 let elem = self.resolve_type(elem);
                 self.expr(size);
-                Ty::Stack(Box::new(elem))
+                Ty::Stack(Box::new(elem), self.const_u32(size))
             }
             TypeKind::Tuple(ts) => {
                 Ty::Tuple(ts.iter().map(|t| self.resolve_type(t)).collect())
@@ -1965,9 +2050,18 @@ impl Resolver<'_> {
     /// members, the declarations it refers to.
     fn expr_inner(&mut self, e: &Expr) -> (Ty, Vec<DefId>) {
         match &e.kind {
-            ExprKind::Int(_) | ExprKind::Bool(_) | ExprKind::Str(_) => {
-                (Ty::Base, Vec::new())
+            ExprKind::Int(lit) => {
+                let ty = match lit.width {
+                    Some(w) => Ty::Bits {
+                        signed: lit.signed,
+                        width: Some(w),
+                    },
+                    None => Ty::Int,
+                };
+                (ty, Vec::new())
             }
+            ExprKind::Bool(_) => (Ty::Bool, Vec::new()),
+            ExprKind::Str(_) => (Ty::String, Vec::new()),
             ExprKind::Path(p) => {
                 if !p.global && p.name.text == "error" {
                     return (Ty::TypeName(Box::new(Ty::Error)), Vec::new());
@@ -2032,7 +2126,7 @@ impl Resolver<'_> {
                 let base = self.expr(base);
                 self.expr(index);
                 match self.s.resolve_alias(&base) {
-                    Ty::Stack(elem) => (*elem, Vec::new()),
+                    Ty::Stack(elem, _) => (*elem, Vec::new()),
                     _ => (Ty::Unknown, Vec::new()),
                 }
             }
