@@ -31,6 +31,11 @@ Features:
   their size and each field's bit offsets; header fields their position;
   constants their value; integer literals their value in decimal, hex, and
   binary; and macro uses what they expand to.
+- Go to implementation (Helix: `gi`): from an architecture's parser,
+  control, or package type (such as `tna.p4`'s `control Ingress`), or a
+  package parameter, to the blocks and instances the program passes for
+  it; from an action to the tables that list it; and from a package or
+  extern type to its instances.
 - Find references, document highlight (with writes marked), and rename.
 - Completion of members after `.` and of names in scope, with keywords and
   macros. Names declared in headers the program does not include yet are

@@ -478,6 +478,62 @@ impl Analysis {
             .collect()
     }
 
+    /// Where the declaration at the cursor is implemented or used as a
+    /// type:
+    /// - an architecture's parser, control, or package type (or a package
+    ///   parameter of one): the blocks and instances the program passes
+    ///   for it;
+    /// - an action: the tables that list it;
+    /// - a package or extern: its instances.
+    pub fn goto_implementation(&self, file: FileId, offset: u32) -> Vec<Span> {
+        let Some((_, Target::Def(d))) = self.target_at(file, offset) else {
+            return Vec::new();
+        };
+        let def = self.sema.def(d);
+        let d = match def.kind {
+            SymbolKind::Parameter => match self.sema.type_def(&def.ty) {
+                Some(t) => t,
+                None => return Vec::new(),
+            },
+            _ => d,
+        };
+        let kind = self.sema.def(d).kind;
+        let mut out: Vec<DefId> = self
+            .sema
+            .implementations
+            .iter()
+            .filter(|&&(abs, _)| abs == d)
+            .map(|&(_, c)| c)
+            .collect();
+        if kind == SymbolKind::Action {
+            let mut tables: Vec<DefId> = self
+                .sema
+                .table_actions
+                .iter()
+                .filter(|(_, acts)| acts.contains(&d))
+                .map(|(&t, _)| t)
+                .collect();
+            tables.sort();
+            out.extend(tables);
+        }
+        if matches!(kind, SymbolKind::Package | SymbolKind::Extern) {
+            out.extend(self.sema.defs.iter().enumerate().filter_map(
+                |(i, x)| {
+                    (x.kind == SymbolKind::Instance
+                        && self.sema.type_def(&x.ty) == Some(d))
+                    .then_some(DefId(i as u32))
+                },
+            ));
+        }
+        let mut spans: Vec<Span> = out
+            .into_iter()
+            .filter_map(|c| self.sema.def(c).name_span)
+            .collect();
+        let mut seen = std::collections::HashSet::new();
+        spans.retain(|s| seen.insert(*s));
+        spans
+    }
+
     /// The comment documenting a declaration: comments directly above it
     /// (with no blank line between), or else a comment trailing it on the
     /// same line.

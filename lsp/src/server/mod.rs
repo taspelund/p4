@@ -189,6 +189,9 @@ impl<'a> Server<'a> {
             type_definition_provider: Some(
                 TypeDefinitionProviderCapability::Simple(true),
             ),
+            implementation_provider: Some(
+                ImplementationProviderCapability::Simple(true),
+            ),
             hover_provider: Some(HoverProviderCapability::Simple(true)),
             references_provider: Some(OneOf::Left(true)),
             document_highlight_provider: Some(OneOf::Left(true)),
@@ -323,6 +326,8 @@ impl<'a> Server<'a> {
             }
             req::GotoTypeDefinition::METHOD => self
                 .dispatch::<req::GotoTypeDefinition>(r, Self::type_definition),
+            req::GotoImplementation::METHOD => self
+                .dispatch::<req::GotoImplementation>(r, Self::implementation),
             req::HoverRequest::METHOD => {
                 self.dispatch::<req::HoverRequest>(r, Self::hover)
             }

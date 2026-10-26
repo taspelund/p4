@@ -83,6 +83,19 @@ impl Server<'_> {
         Ok(Some(GotoDefinitionResponse::Array(locs)))
     }
 
+    pub(super) fn implementation(
+        &mut self,
+        p: GotoDefinitionParams,
+    ) -> Result<Option<GotoDefinitionResponse>> {
+        let Some((t, offset)) = self.at(&p.text_document_position_params)
+        else {
+            return Ok(None);
+        };
+        let a = self.analysis(&t);
+        let locs = self.locations(a, a.goto_implementation(t.file, offset));
+        Ok(Some(GotoDefinitionResponse::Array(locs)))
+    }
+
     pub(super) fn hover(&mut self, p: HoverParams) -> Result<Option<Hover>> {
         let Some((t, offset)) = self.at(&p.text_document_position_params)
         else {

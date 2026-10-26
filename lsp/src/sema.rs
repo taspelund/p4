@@ -200,6 +200,10 @@ pub struct Sema {
     /// Values whose fixed-width type differs from the expected one, for
     /// the cast quick fix.
     pub mismatches: Vec<Mismatch>,
+    /// `(abstract, concrete)`: a parser, control, or package type (such as
+    /// an architecture's `control Ingress<H, M>(...)`) and the block or
+    /// instance passed for it when a package is instantiated.
+    pub implementations: Vec<(DefId, DefId)>,
     builtins: HashMap<&'static str, DefId>,
 }
 
@@ -1421,6 +1425,7 @@ impl Resolver<'_> {
                 }
                 let candidates = pick_overloads(&self.s, all, i.args.len());
                 self.args(&i.args, &candidates);
+                self.record_implementations(&candidates, &i.args);
                 let id = self.def_for(&i.name);
                 if let Some(id) = id {
                     self.s.defs[id.0 as usize].ty = ty.clone();
@@ -2205,6 +2210,61 @@ impl Resolver<'_> {
         self.report(Diagnostic::error(a.value.span, msg).with_code("type"));
     }
 
+    /// Record which blocks or instances are passed for the parser,
+    /// control, and package parameters of a constructor call.
+    fn record_implementations(
+        &mut self,
+        candidates: &[DefId],
+        args: &[Argument],
+    ) {
+        let [ctor] = candidates[..] else { return };
+        if !matches!(
+            self.s.def(ctor).kind,
+            SymbolKind::Package | SymbolKind::Parser | SymbolKind::Control
+        ) {
+            return;
+        }
+        let params = self.s.def(ctor).params.clone();
+        for (i, a) in args.iter().enumerate() {
+            let param = match &a.name {
+                Some(n) => params
+                    .iter()
+                    .copied()
+                    .find(|&p| self.s.def(p).name == n.text),
+                None => params.get(i).copied(),
+            };
+            let Some(abs) =
+                param.and_then(|p| self.s.type_def(&self.s.def(p).ty))
+            else {
+                continue;
+            };
+            if !matches!(
+                self.s.def(abs).kind,
+                SymbolKind::Package | SymbolKind::Parser | SymbolKind::Control
+            ) {
+                continue;
+            }
+            let name = match &a.value.kind {
+                ExprKind::Call { callee, .. } => callee_name_span(callee),
+                ExprKind::Path(p) => Some(p.name.span),
+                _ => None,
+            };
+            let concrete = name.and_then(|n| {
+                self.s
+                    .refs
+                    .iter()
+                    .rev()
+                    .find(|r| r.span == n)
+                    .map(|r| r.def)
+            });
+            if let Some(c) = concrete {
+                if c != abs {
+                    self.s.implementations.push((abs, c));
+                }
+            }
+        }
+    }
+
     /// Every action and function named `name` in the enclosing scopes.
     fn visible_callables(&self, name: &str) -> Vec<DefId> {
         let mut out = Vec::new();
@@ -2719,6 +2779,7 @@ impl Resolver<'_> {
                 }
                 let arg_tys = self.args(args, &candidates);
                 self.check_call(callee, &all, args, &arg_tys);
+                self.record_implementations(&candidates, args);
                 let ty = match candidates.first() {
                     Some(&c) => {
                         let def = self.s.def(c);

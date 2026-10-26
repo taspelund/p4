@@ -1290,6 +1290,43 @@ SoftNPU(c(), c()) main;
 }
 
 #[test]
+fn goto_implementation() {
+    let f = fixture(&[(
+        "main.p4",
+        "extern Counter { Counter(bit<32> n); void count(); }
+parser ParserT<H>(packet_in p, out H h);
+control Ingr$0essT<H>(inout H h);
+package Pipe$1line<H>(ParserT<H> prs, IngressT<H> i$2ng);
+package Switch<H>(Pipeline<H> p0);
+struct h_t { }
+parser MyParser(packet_in p, out h_t h) { state start { transition accept; } }
+control MyIngress(inout h_t h) {
+    Coun$3ter(4) c1;
+    Counter(8) c2;
+    action fw$4d() { }
+    table t1 { key = { } actions = { fwd; } }
+    table t2 { key = { } actions = { fwd; NoAction; } }
+    apply { }
+}
+Pipeline(MyParser(), MyIngress()) pipe;
+Switch(pipe) main;
+",
+    )]);
+    let impls = |m: &str| {
+        let (file, off) = f.at(m);
+        f.a.goto_implementation(file, off)
+            .into_iter()
+            .map(|s| f.show(s))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(impls("0"), ["main.p4:8:MyIngress"]);
+    assert_eq!(impls("2"), ["main.p4:8:MyIngress"]);
+    assert_eq!(impls("1"), ["main.p4:16:pipe"]);
+    assert_eq!(impls("3"), ["main.p4:9:c1", "main.p4:10:c2"]);
+    assert_eq!(impls("4"), ["main.p4:12:t1", "main.p4:13:t2"]);
+}
+
+#[test]
 fn keyset_struct_and_packet_type_checks() {
     let f = fixture(&[(
         "main.p4",
