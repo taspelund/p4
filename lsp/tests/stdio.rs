@@ -275,3 +275,111 @@ fn exit_without_shutdown_fails() {
     };
     assert_eq!(status.code(), Some(1));
 }
+
+/// Defines toggled with `workspace/executeCommand`, directly and through
+/// the `window/showMessageRequest` menu, change what is analyzed.
+#[test]
+fn configuration_commands() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path().canonicalize().unwrap();
+    let file = ws.join("prog.p4");
+    let text = "control c(inout bit<8> x) {
+    apply {
+#ifdef MULTICAST
+        x = missing;
+#endif
+    }
+}
+";
+    std::fs::write(&file, text).unwrap();
+    let ws_uri = format!("file://{}", ws.display());
+    let uri = format!("file://{}", file.display());
+    let errors = |d: &Value| -> Vec<String> {
+        d["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|d| d["severity"] == 1)
+            .map(|d| d["message"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    let mut c = Client::spawn();
+    c.request(
+        1,
+        "initialize",
+        json!({
+            "processId": null,
+            "rootUri": ws_uri,
+            "workspaceFolders": [{"uri": ws_uri, "name": "ws"}],
+            "capabilities": {},
+        }),
+    );
+    let init = c.response(1);
+    let commands =
+        &init["result"]["capabilities"]["executeCommandProvider"]["commands"];
+    assert!(commands
+        .as_array()
+        .unwrap()
+        .contains(&json!("x4c.configure")));
+    c.notify("initialized", json!({}));
+    // A document named in the arguments is used even if none is open.
+    c.request(
+        9,
+        "workspace/executeCommand",
+        json!({"command": "x4c.showConfiguration", "arguments": [uri]}),
+    );
+    let msg =
+        c.wait_for("showMessage", |m| m["method"] == "window/showMessage");
+    assert_eq!(
+        msg["params"]["message"],
+        "x4c-lsp: prog.p4 is analyzed with no defines"
+    );
+    assert_eq!(c.response(9)["result"], Value::Null);
+    c.notify(
+        "textDocument/didOpen",
+        json!({"textDocument": {
+            "uri": uri, "languageId": "p4", "version": 1, "text": text,
+        }}),
+    );
+    assert!(errors(&c.diagnostics(&uri)).is_empty());
+
+    c.request(
+        2,
+        "workspace/executeCommand",
+        json!({"command": "x4c.toggleDefine", "arguments": ["MULTICAST"]}),
+    );
+    let msg =
+        c.wait_for("showMessage", |m| m["method"] == "window/showMessage");
+    assert_eq!(
+        msg["params"]["message"],
+        "x4c-lsp: prog.p4 is analyzed with defines MULTICAST \
+         (changed from the configuration)"
+    );
+    assert_eq!(c.response(2)["result"], Value::Null);
+    assert_eq!(
+        errors(&c.diagnostics(&uri)),
+        ["cannot find name `missing` in this scope"]
+    );
+
+    c.request(
+        3,
+        "workspace/executeCommand",
+        json!({"command": "x4c.configure"}),
+    );
+    let menu = c.wait_for("showMessageRequest", |m| {
+        m["method"] == "window/showMessageRequest"
+    });
+    let titles: Vec<&str> = menu["params"]["actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["title"].as_str().unwrap())
+        .collect();
+    assert_eq!(titles, ["Undefine MULTICAST", "Reset to the configuration"]);
+    c.send(json!({
+        "jsonrpc": "2.0", "id": menu["id"],
+        "result": {"title": "Reset to the configuration"},
+    }));
+    assert!(errors(&c.diagnostics(&uri)).is_empty());
+}

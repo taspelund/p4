@@ -40,6 +40,9 @@ macro_rules! log {
     ($($arg:tt)*) => { eprintln!("x4c-lsp: {}", format_args!($($arg)*)) };
 }
 
+// After `log!`, which it uses.
+mod commands;
+
 /// Run the server over stdio until the client sends `exit`.
 ///
 /// Returns an error if the connection fails or the client exits without a
@@ -132,6 +135,10 @@ pub struct Server<'a> {
     needs_publish: bool,
     shutdown: bool,
     next_request: i32,
+    /// The P4 document the user last worked in, for commands.
+    active: Option<PathBuf>,
+    /// The configuration menu awaiting the client's answer.
+    pending_choice: Option<(RequestId, Vec<(String, commands::Choice)>)>,
 }
 
 impl<'a> Server<'a> {
@@ -156,6 +163,8 @@ impl<'a> Server<'a> {
             needs_publish: false,
             shutdown: false,
             next_request: 0,
+            active: None,
+            pending_choice: None,
         };
         if let Some(opts) = &params.initialization_options {
             server.set_client_config(opts);
@@ -225,6 +234,10 @@ impl<'a> Server<'a> {
                 },
             )),
             inlay_hint_provider: Some(OneOf::Left(true)),
+            execute_command_provider: Some(ExecuteCommandOptions {
+                commands: commands::ALL.iter().map(|c| c.to_string()).collect(),
+                work_done_progress_options: Default::default(),
+            }),
             rename_provider: Some(OneOf::Right(RenameOptions {
                 prepare_provider: Some(true),
                 work_done_progress_options: Default::default(),
@@ -298,6 +311,9 @@ impl<'a> Server<'a> {
                 false
             }
             Message::Response(r) => {
+                if self.menu_response(&r.id, r.result.clone()) {
+                    return false;
+                }
                 if let Some(e) = r.error {
                     log!("client returned error for {:?}: {}", r.id, e.message);
                 }
@@ -366,6 +382,9 @@ impl<'a> Server<'a> {
             req::InlayHintRequest::METHOD => {
                 self.dispatch::<req::InlayHintRequest>(r, Self::inlay_hints)
             }
+            req::ExecuteCommand::METHOD => {
+                self.dispatch::<req::ExecuteCommand>(r, Self::execute_command)
+            }
             m => Err(response_error(
                 ErrorCode::MethodNotFound,
                 format!("unknown request `{m}`"),
@@ -429,6 +448,7 @@ impl<'a> Server<'a> {
                     path.clone(),
                     Document::new(doc.uri, doc.version, doc.text),
                 );
+                self.set_active(&path);
                 self.text_changed(&path);
             }
             notif::DidChangeTextDocument::METHOD => {
@@ -445,6 +465,7 @@ impl<'a> Server<'a> {
                     p.content_changes,
                     self.enc,
                 );
+                self.set_active(&path);
                 self.text_changed(&path);
             }
             notif::DidSaveTextDocument::METHOD => {
@@ -498,6 +519,12 @@ impl<'a> Server<'a> {
             // `$/cancelRequest`, `$/setTrace`, and anything else: requests
             // are answered in order, so there is nothing to cancel.
             _ => {}
+        }
+    }
+
+    fn set_active(&mut self, path: &Path) {
+        if path.extension().is_some_and(|e| e == "p4") {
+            self.active = Some(path.to_path_buf());
         }
     }
 

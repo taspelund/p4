@@ -138,8 +138,41 @@ Root `include`s are searched first, then the global `include`s. Root
 - **Roots** are inferred: `.p4` files in the opened file's directory that
   instantiate `main` (e.g. `V1Switch(...) main;`) are candidate roots, with
   their directory on the include path. The first candidate whose include
-  closure contains the opened file is used; otherwise the file is analyzed on
-  its own.
+  closure contains the opened file is used. A file outside the project
+  (such as an architecture header reached with go to definition) uses the
+  program that includes it; any other file is analyzed on its own.
+
+### Switching configurations from the editor
+
+These commands change what the current file is analyzed with, for the rest
+of the session, without editing `x4c-lsp.toml` (Helix:
+`:lsp-workspace-command`, which lists them):
+
+- `x4c.configure` opens a menu to define or undefine the macros the
+  program tests in `#if`/`#ifdef` (and those already defined), or to use
+  another root that includes the file, such as the second root in the
+  example above.
+- `x4c.toggleDefine` toggles one macro, e.g.
+  `:lsp-workspace-command x4c.toggleDefine "MULTICAST"` (bind it to a key
+  for quick switching). `"NAME=VALUE"` sets a value.
+- `x4c.showConfiguration` shows the file's root and defines.
+- `x4c.resetConfiguration` returns to the configuration.
+
+Session defines apply to every root on top of the configured ones.
+
+`x4c.configure` and `x4c.showConfiguration` act on the file passed as their
+argument (a path or `file://` URI), or else on the P4 file last opened,
+edited, or queried. A Steel-enabled Helix can wrap the menu in a command
+for the current buffer:
+
+```scheme
+(define (lsp-configure)
+  (send-lsp-command "x4c-lsp" "workspace/executeCommand"
+    (hash "command" "x4c.configure"
+          "arguments" (list (editor-document->path
+                              (editor->doc-id (editor-focus)))))
+    (lambda (_) void)))
+```
 
 ### Editor settings
 

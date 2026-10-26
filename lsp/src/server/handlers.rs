@@ -23,6 +23,7 @@ impl Server<'_> {
     /// to no root (e.g. non-P4 files), which get empty results.
     fn target(&mut self, uri: &Url) -> Option<Target> {
         let path = uri_to_path(uri)?;
+        self.set_active(&path);
         let root = self.root_for(&path)?;
         let r = &self.roots.roots[root];
         r.analysis.as_ref()?;

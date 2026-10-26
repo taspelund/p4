@@ -30,9 +30,36 @@ pub enum RootKind {
     Standalone,
 }
 
+/// Configuration changes made from the editor for this session, applied on
+/// top of `x4c-lsp.toml` and client settings.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Overrides {
+    /// Macros defined (or redefined) for every root.
+    pub define: Vec<(String, String)>,
+    /// Macros undefined for every root.
+    pub undefine: Vec<String>,
+    /// A root to try before the others: its file and configured options.
+    pub prefer: Option<(PathBuf, Options)>,
+}
+
+impl Overrides {
+    /// Define `name`, or undefine it.
+    pub fn set_define(&mut self, name: &str, value: Option<&str>) {
+        self.define.retain(|(n, _)| n != name);
+        self.undefine.retain(|n| n != name);
+        match value {
+            Some(v) => self.define.push((name.into(), v.into())),
+            None => self.undefine.push(name.into()),
+        }
+    }
+}
+
 pub struct Root {
     pub file: PathBuf,
+    /// The options analyzed with: `base` with the session's overrides.
     pub options: Options,
+    /// The options from configuration (or inference).
+    pub base: Options,
     pub kind: RootKind,
     pub analysis: Option<Analysis>,
     /// Every file loaded by the last analysis, by normalized path.
@@ -66,6 +93,7 @@ pub struct RootManager {
     closures_changed: bool,
     warnings: Vec<String>,
     reported: HashSet<String>,
+    overrides: Overrides,
 }
 
 impl RootManager {
@@ -83,6 +111,7 @@ impl RootManager {
             closures_changed: false,
             warnings: Vec::new(),
             reported: HashSet::new(),
+            overrides: Overrides::default(),
         }
     }
 
@@ -106,6 +135,29 @@ impl RootManager {
         self.client_config = config;
         self.reset();
         true
+    }
+
+    pub fn overrides(&self) -> &Overrides {
+        &self.overrides
+    }
+
+    /// Replace the session's overrides. Returns whether they changed.
+    pub fn set_overrides(&mut self, overrides: Overrides) -> bool {
+        if self.overrides == overrides {
+            return false;
+        }
+        self.overrides = overrides;
+        self.reset();
+        true
+    }
+
+    /// `base` with the session's defines applied.
+    fn effective(&self, base: &Options) -> Options {
+        let mut o = base.clone();
+        o.defines
+            .retain(|(n, _)| !self.overrides.undefine.contains(n));
+        config::merge_defines(&mut o.defines, self.overrides.define.clone());
+        o
     }
 
     /// Forget all configuration, roots, and analyses.
@@ -199,16 +251,17 @@ impl RootManager {
     fn ensure_root(
         &mut self,
         file: &Path,
-        options: Options,
+        base: Options,
         kind: RootKind,
     ) -> RootId {
         if let Some(id) = self
             .roots
             .iter()
-            .position(|r| r.file == file && r.options == options)
+            .position(|r| r.file == file && r.base == base)
         {
             return id;
         }
+        let options = self.effective(&base);
         eprintln!(
             "x4c-lsp: {kind:?} root {} with {:?}",
             file.display(),
@@ -217,6 +270,7 @@ impl RootManager {
         self.roots.push(Root {
             file: file.to_path_buf(),
             options,
+            base,
             kind,
             analysis: None,
             files: HashMap::new(),
@@ -288,36 +342,76 @@ impl RootManager {
     }
 
     fn resolve(&mut self, path: &Path, overlays: &Overlays) -> Option<RootId> {
-        let project = self.project_for(path);
-        let dir = path.parent().unwrap_or(Path::new("/")).to_path_buf();
-        if !project.roots.is_empty() {
-            for spec in &project.roots {
-                let id = self.ensure_root(
-                    &spec.file,
-                    spec.options.clone(),
-                    RootKind::Configured,
-                );
-                self.refresh(id, overlays);
-                if self.roots[id].contains(path) {
-                    return Some(id);
-                }
-            }
-        } else {
-            for candidate in self.candidates(&dir, overlays) {
-                let options = project.options(std::slice::from_ref(&dir));
-                let id =
-                    self.ensure_root(&candidate, options, RootKind::Inferred);
-                self.refresh(id, overlays);
-                if self.roots[id].contains(path) {
-                    return Some(id);
-                }
-            }
+        if let Some(&id) = self.choices(path, overlays, true).first() {
+            return Some(id);
+        }
+        // A header outside the project (an architecture file reached by
+        // going to a definition) belongs to the program that includes it.
+        if let Some(id) = self
+            .roots
+            .iter()
+            .position(|r| r.kind != RootKind::Standalone && r.contains(path))
+        {
+            return Some(id);
         }
         if path.extension().is_some_and(|e| e == "p4") {
+            let project = self.project_for(path);
+            let dir = path.parent().unwrap_or(Path::new("/")).to_path_buf();
             let options = project.options(std::slice::from_ref(&dir));
             return Some(self.ensure_root(path, options, RootKind::Standalone));
         }
         None
+    }
+
+    /// The configured roots (or, without any, the programs in the file's
+    /// directory) whose include closure contains `path`, the preferred one
+    /// first. With `first`, stops at the first match.
+    pub fn choices(
+        &mut self,
+        path: &Path,
+        overlays: &Overlays,
+        first: bool,
+    ) -> Vec<RootId> {
+        let project = self.project_for(path);
+        let dir = path.parent().unwrap_or(Path::new("/")).to_path_buf();
+        let (mut entries, kind): (Vec<(PathBuf, Options)>, _) =
+            if !project.roots.is_empty() {
+                let e = project
+                    .roots
+                    .iter()
+                    .map(|r| (r.file.clone(), r.options.clone()))
+                    .collect();
+                (e, RootKind::Configured)
+            } else {
+                let options = project.options(std::slice::from_ref(&dir));
+                let e = self
+                    .candidates(&dir, overlays)
+                    .into_iter()
+                    .map(|c| (c, options.clone()))
+                    .collect();
+                (e, RootKind::Inferred)
+            };
+        if let Some(i) = self
+            .overrides
+            .prefer
+            .as_ref()
+            .and_then(|p| entries.iter().position(|e| e == p))
+        {
+            let e = entries.remove(i);
+            entries.insert(0, e);
+        }
+        let mut out = Vec::new();
+        for (file, base) in entries {
+            let id = self.ensure_root(&file, base, kind);
+            self.refresh(id, overlays);
+            if self.roots[id].contains(path) {
+                out.push(id);
+                if first {
+                    break;
+                }
+            }
+        }
+        out
     }
 
     /// Program roots in `dir`, sorted by path. Cached until
@@ -495,6 +589,46 @@ mod tests {
             m.roots[id].options.defines,
             vec![("__TARGET_TOFINO__".to_string(), "2".to_string())]
         );
+
+        // Preferring the second root (as chosen from the editor) makes it
+        // win; session defines apply on top of its configuration.
+        let both = m.choices(&main, &overlays, false);
+        assert_eq!(both.len(), 2);
+        let second = &m.roots[both[1]];
+        let mut ov = Overrides {
+            prefer: Some((second.file.clone(), second.base.clone())),
+            ..Default::default()
+        };
+        ov.set_define("__TARGET_TOFINO__", None);
+        ov.set_define("EXTRA", Some("3"));
+        assert!(m.set_overrides(ov));
+        let id = m.root_for(&main, &overlays).unwrap();
+        let def = |n: &str, v: &str| (n.to_string(), v.to_string());
+        assert_eq!(
+            m.roots[id].options.defines,
+            vec![def("MULTICAST", "1"), def("EXTRA", "3")]
+        );
+    }
+
+    #[test]
+    fn outside_headers_join_the_including_program() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let ws = base.join("ws");
+        let arch = base.join("include/arch.p4");
+        write(&arch, "control C();\n");
+        let main = ws.join("main.p4");
+        write(&main, "#include <arch.p4>\nPkg(c()) main;\n");
+        let mut m = manager(&ws);
+        m.set_client_config(
+            RawConfig::from_json(&serde_json::json!({
+                "include": [base.join("include").display().to_string()],
+            }))
+            .unwrap(),
+        );
+        let overlays = Overlays::new();
+        let prog = m.root_for(&main, &overlays).unwrap();
+        assert_eq!(m.root_for(&arch, &overlays), Some(prog));
     }
 
     #[test]
