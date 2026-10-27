@@ -1682,6 +1682,12 @@ impl Analysis {
         {
             return Vec::new();
         }
+        // Edits go only into the file being completed (a fragment's include
+        // would belong in the root).
+        let site = crate::headers::IncludeSite::new(self, file);
+        if site.target != file {
+            return Vec::new();
+        }
         let index =
             crate::headers::HeaderIndex::for_dirs(&self.opts.include_dirs);
         let mut out = Vec::new();
@@ -1689,14 +1695,9 @@ impl Analysis {
             if seen.contains(&name) {
                 continue;
             }
-            let Some(edit) =
-                crate::headers::include_edit(self, file, &cand.include)
-            else {
+            let Some(edit) = site.edit(&cand.include) else {
                 continue;
             };
-            if edit.0.file != file {
-                continue;
-            }
             out.push(Completion {
                 detail: Some(format!("#include <{}>", cand.include)),
                 documentation: Some(format!("```p4\n{}\n```", cand.detail)),

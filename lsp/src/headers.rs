@@ -535,71 +535,96 @@ pub fn include_edit(
     file: FileId,
     include: &str,
 ) -> Option<(Span, String)> {
-    let has_includes =
-        |f: FileId| lines(a.db.text(f)).iter().any(|l| l.include.is_some());
-    let target = if file == a.root || has_includes(file) {
-        file
-    } else {
-        a.root
-    };
-    let text = a.db.text(target);
-    let lines = lines(text);
-    if lines
-        .iter()
-        .any(|l| l.include.as_ref().is_some_and(|(n, _)| n == include))
-    {
-        return None;
-    }
-    let directive = format!("#include <{include}>\n");
-    let at = |offset: usize, insert: String| {
-        Some((Span::new(target, offset as u32, offset as u32), insert))
-    };
-    // The leading block of comments, blank lines, and directives.
-    let leading = lines
-        .iter()
-        .position(|l| l.kind == LineKind::Code)
-        .unwrap_or(lines.len());
-    let block = &lines[..leading];
-    let min_depth = block
-        .iter()
-        .filter_map(|l| l.include.as_ref().map(|_| l.depth))
-        .min();
-    if let Some(depth) = min_depth {
-        let last = block
-            .iter()
-            .rev()
-            .find(|l| l.include.is_some() && l.depth == depth)?;
-        if last.next == text.len() && !text.ends_with('\n') {
-            return at(text.len(), format!("\n{directive}"));
+    IncludeSite::new(a, file).edit(include)
+}
+
+/// Where `#include`s go for a file, computed once so that many candidate
+/// headers can be placed cheaply (completion offers up to 200).
+pub struct IncludeSite<'a> {
+    /// The file that gets the `#include`.
+    pub target: FileId,
+    text: &'a str,
+    lines: Vec<Line>,
+}
+
+impl<'a> IncludeSite<'a> {
+    /// See [`include_edit`] for which file is edited.
+    pub fn new(a: &'a Analysis, file: FileId) -> Self {
+        let own = lines(a.db.text(file));
+        let (target, lines) =
+            if file == a.root || own.iter().any(|l| l.include.is_some()) {
+                (file, own)
+            } else {
+                (a.root, lines(a.db.text(a.root)))
+            };
+        IncludeSite {
+            target,
+            text: a.db.text(target),
+            lines,
         }
-        return at(last.next, directive);
     }
-    let comments = lines
-        .iter()
-        .take_while(|l| l.kind == LineKind::Comment)
-        .count();
-    if comments == 0 {
-        let sep = match lines.first() {
-            Some(l) if l.kind != LineKind::Blank => "\n",
-            _ => "",
+
+    /// The edit adding `#include <include>`, or `None` if the file already
+    /// includes it.
+    pub fn edit(&self, include: &str) -> Option<(Span, String)> {
+        let (target, text, lines) = (self.target, self.text, &self.lines);
+        if lines
+            .iter()
+            .any(|l| l.include.as_ref().is_some_and(|(n, _)| n == include))
+        {
+            return None;
+        }
+        let directive = format!("#include <{include}>\n");
+        let at = |offset: usize, insert: String| {
+            Some((Span::new(target, offset as u32, offset as u32), insert))
         };
-        return at(0, format!("{directive}{sep}"));
+        // The leading block of comments, blank lines, and directives.
+        let leading = lines
+            .iter()
+            .position(|l| l.kind == LineKind::Code)
+            .unwrap_or(lines.len());
+        let block = &lines[..leading];
+        let min_depth = block
+            .iter()
+            .filter_map(|l| l.include.as_ref().map(|_| l.depth))
+            .min();
+        if let Some(depth) = min_depth {
+            let last = block
+                .iter()
+                .rev()
+                .find(|l| l.include.is_some() && l.depth == depth)?;
+            if last.next == text.len() && !text.ends_with('\n') {
+                return at(text.len(), format!("\n{directive}"));
+            }
+            return at(last.next, directive);
+        }
+        let comments = lines
+            .iter()
+            .take_while(|l| l.kind == LineKind::Comment)
+            .count();
+        if comments == 0 {
+            let sep = match lines.first() {
+                Some(l) if l.kind != LineKind::Blank => "\n",
+                _ => "",
+            };
+            return at(0, format!("{directive}{sep}"));
+        }
+        let blanks = lines[comments..]
+            .iter()
+            .take_while(|l| l.kind == LineKind::Blank)
+            .count();
+        let k = comments + blanks;
+        let offset = lines.get(k).map(|l| l.start).unwrap_or(text.len());
+        let mut before = String::new();
+        if offset == text.len() && !text.is_empty() && !text.ends_with('\n') {
+            before.push('\n');
+        }
+        if blanks == 0 {
+            before.push('\n');
+        }
+        let after = if k < lines.len() { "\n" } else { "" };
+        at(offset, format!("{before}{directive}{after}"))
     }
-    let blanks = lines[comments..]
-        .iter()
-        .take_while(|l| l.kind == LineKind::Blank)
-        .count();
-    let k = comments + blanks;
-    let offset = lines.get(k).map(|l| l.start).unwrap_or(text.len());
-    let mut before = String::new();
-    if offset == text.len() && !text.is_empty() && !text.ends_with('\n') {
-        before.push('\n');
-    }
-    if blanks == 0 {
-        before.push('\n');
-    }
-    let after = if k < lines.len() { "\n" } else { "" };
-    at(offset, format!("{before}{directive}{after}"))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
