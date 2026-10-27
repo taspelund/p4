@@ -53,9 +53,9 @@ returns a `*mut dyn Pipeline` object.
 ### Editor support
 
 [`x4c-lsp`](lsp) is a language server for P4-16 programs, whether or not
-they are compiled with `x4c`. It provides diagnostics, navigation, and
-completion in any editor that speaks the Language Server Protocol. To
-install it and set up Helix, see [lsp/README.md](lsp/README.md).
+they are compiled with `x4c`. It provides diagnostics, navigation,
+completion, and code actions in any editor that speaks the Language Server
+Protocol. To install it and set up Helix, see [lsp/README.md](lsp/README.md).
 
 ## Goals
 
