@@ -30,6 +30,8 @@ pub fn code_actions(
     cx.generate_emits(&mut out);
     cx.generate_parse_states(&mut out);
     cx.literal_to_const(&mut out);
+    cx.extract_constant(&mut out);
+    cx.sort_table_actions(&mut out);
     cx.inline_macro(&mut out);
     out
 }
@@ -177,6 +179,14 @@ impl<'a> Cx<'a> {
                         });
                     }
                 }
+                UnresolvedKind::Member(ty) => {
+                    if let Some(a) = self.add_field(&u.name, u.span, ty) {
+                        out.push(CodeAction {
+                            fixes: Some(u.span),
+                            ..a
+                        });
+                    }
+                }
                 UnresolvedKind::Name | UnresolvedKind::Type => {
                     let index =
                         HeaderIndex::for_dirs(&self.a.opts.include_dirs);
@@ -203,6 +213,118 @@ impl<'a> Cx<'a> {
                 _ => {}
             }
         }
+    }
+
+    /// Whether declarations in `file` may be edited: not when it is in an
+    /// include directory, such as an architecture header, unless the
+    /// program's root is in the same directory.
+    fn editable(&self, file: FileId) -> bool {
+        let path = self.a.db.path(file);
+        let root = self.a.db.path(self.a.root);
+        !self
+            .a
+            .opts
+            .include_dirs
+            .iter()
+            .any(|d| path.starts_with(d) && !root.starts_with(d))
+    }
+
+    /// The type of an expression, as P4 source, when it is evident: a
+    /// sized literal, a bool, a cast, or a name or member with a declared
+    /// type.
+    fn type_of(&self, e: &Expr) -> Option<String> {
+        let sema = &self.a.sema;
+        let name = match &e.kind {
+            ExprKind::Int(IntLit {
+                width: Some(w),
+                signed,
+                ..
+            }) => {
+                return Some(format!(
+                    "{}<{w}>",
+                    if *signed { "int" } else { "bit" }
+                ))
+            }
+            ExprKind::Bool(_) => return Some("bool".into()),
+            ExprKind::Cast { ty, .. } => {
+                return Some(self.a.db.slice(ty.span).to_string())
+            }
+            ExprKind::Member { member, .. } => member.span,
+            ExprKind::Path(p) => p.name.span,
+            _ => return None,
+        };
+        let r = sema.refs.iter().find(|r| r.span == name)?;
+        sema.type_text.get(&r.def).cloned()
+    }
+
+    /// The other side of the assignment or binary operation whose one side
+    /// is the expression at `span`.
+    fn counterpart(&self, span: Span) -> Option<&'a Expr> {
+        let mut found = None;
+        let mut pair = |a: &'a Expr, b: &'a Expr| {
+            if a.span == span {
+                found = Some(b);
+            } else if b.span == span {
+                found = Some(a);
+            }
+        };
+        each_stmt(&self.a.parse.program.decls, &mut |s| {
+            if let StmtKind::Assign { lhs, rhs, .. } = &s.kind {
+                pair(lhs, rhs);
+            }
+        });
+        each_expr(&self.a.parse.program.decls, &mut |e| {
+            if let ExprKind::Binary { lhs, rhs, .. } = &e.kind {
+                pair(lhs, rhs);
+            }
+        });
+        found
+    }
+
+    /// Add a missing field to the struct or header it was looked up in,
+    /// typed after the other side of its assignment or comparison.
+    fn add_field(&self, name: &str, at: Span, ty: &Ty) -> Option<CodeAction> {
+        let sema = &self.a.sema;
+        let d = sema.type_def(&sema.resolve_alias(ty))?;
+        let def = sema.def(d);
+        if !matches!(
+            def.kind,
+            SymbolKind::Struct | SymbolKind::Header | SymbolKind::HeaderUnion
+        ) || name.is_empty()
+        {
+            return None;
+        }
+        let span = def.span?;
+        if !self.editable(span.file) {
+            return None;
+        }
+        // The member expression whose name is `at`.
+        let mut access = None;
+        each_expr(&self.a.parse.program.decls, &mut |e| {
+            if let ExprKind::Member { member, .. } = &e.kind {
+                if member.span == at {
+                    access = Some(e.span);
+                }
+            }
+        });
+        let field_ty = access
+            .and_then(|s| self.counterpart(s))
+            .and_then(|e| self.type_of(e))
+            .unwrap_or_else(|| "bit<8>".into());
+        let text = self.a.db.text(span.file);
+        let u = unit(text);
+        let (pos, indent, lead) = before_close(text, span, &u)?;
+        let insert = format!(
+            "{lead}{indent}{field_ty} {name};\n{}",
+            close_indent(&indent, &u, &lead)
+        );
+        Some(CodeAction {
+            title: format!("Add field `{field_ty} {name}` to `{}`", def.name),
+            kind: CodeActionKind::QuickFix,
+            edits: vec![self.insert(span.file, pos, insert)],
+            fixes: None,
+            preferred: false,
+        })
     }
 
     /// An empty action inserted before the table that names it.
@@ -655,6 +777,183 @@ impl<'a> Cx<'a> {
         }
     }
 
+    /// Move an integer literal into a new constant declared before the
+    /// declaration containing it (at the top level, or among a control's
+    /// or parser's locals). The name comes from what the literal is
+    /// assigned to or compared with, e.g. `ETHER_TYPE_0800` for
+    /// `hdr.eth.ether_type == 0x0800`; rename it afterwards.
+    fn extract_constant(&self, out: &mut Vec<CodeAction>) {
+        let mut lit: Option<(Span, &'a IntLit)> = None;
+        each_expr(&self.a.parse.program.decls, &mut |e| {
+            if let ExprKind::Int(i) = &e.kind {
+                if self.inside(e.span) && self.a.db.slice(e.span) == i.text {
+                    lit = Some((e.span, i));
+                }
+            }
+        });
+        let Some((span, lit)) = lit else { return };
+        let contains = |s: Span| {
+            s.file == span.file && s.start <= span.start && span.end <= s.end
+        };
+        // The innermost declaration in a declaration list containing it.
+        let mut target = None;
+        for d in &self.a.parse.program.decls {
+            if contains(d.span()) {
+                target = Some(d.span());
+            }
+            let locals = match d {
+                Decl::Control(c) => &c.locals,
+                Decl::Parser(p) => &p.locals,
+                _ => continue,
+            };
+            for l in locals {
+                if contains(l.span()) {
+                    target = Some(l.span());
+                }
+            }
+        }
+        let Some(target) = target else { return };
+        // A constant declaration's own initializer is already a constant.
+        if self
+            .a
+            .sema
+            .defs
+            .iter()
+            .any(|d| d.kind == SymbolKind::Constant && d.span == Some(target))
+        {
+            return;
+        }
+        let other = self.counterpart(span);
+        let ty = self
+            .type_of(&Expr {
+                kind: ExprKind::Int(lit.clone()),
+                span,
+            })
+            .or_else(|| other.and_then(|e| self.type_of(e)))
+            .unwrap_or_else(|| "int".into());
+        let base = other
+            .and_then(|e| match &e.kind {
+                ExprKind::Member { member, .. } => Some(member.text.clone()),
+                ExprKind::Path(p) => Some(p.name.text.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| "VALUE".into());
+        let digits = lit.text.rsplit(['w', 's']).next().unwrap_or(&lit.text);
+        let digits = digits
+            .strip_prefix("0x")
+            .or_else(|| digits.strip_prefix("0X"))
+            .unwrap_or(digits)
+            .replace('_', "");
+        let mut name = format!("{base}_{digits}").to_uppercase();
+        let taken: Vec<String> = self
+            .a
+            .sema
+            .visible_at(span)
+            .into_iter()
+            .map(|d| self.a.sema.def(d).name.clone())
+            .collect();
+        if taken.contains(&name) {
+            let mut i = 2;
+            while taken.contains(&format!("{name}_{i}")) {
+                i += 1;
+            }
+            name = format!("{name}_{i}");
+        }
+        let text = self.a.db.text(span.file);
+        let ls = line_start(text, target.start);
+        let indent = indent_at(text, ls);
+        let blank = if indent.is_empty() { "\n" } else { "" };
+        out.push(CodeAction {
+            title: format!("Extract constant `{name}`"),
+            kind: CodeActionKind::Extract,
+            edits: vec![
+                self.insert(
+                    span.file,
+                    ls,
+                    format!(
+                        "{indent}const {ty} {name} = {};\n{blank}",
+                        lit.text
+                    ),
+                ),
+                (span, name),
+            ],
+            fixes: None,
+            preferred: false,
+        });
+    }
+
+    /// Sort a table's `actions` list by name, or remove duplicate entries.
+    /// Offered only when nothing but `;` and whitespace separates the
+    /// entries, so no comment is moved away from its entry.
+    fn sort_table_actions(&self, out: &mut Vec<CodeAction>) {
+        let mut found = None;
+        walk_tables(&self.a.parse.program.decls, &mut |t| {
+            for p in &t.properties {
+                if let PropertyValue::Actions(list) = &p.value {
+                    if self.inside(p.span) && list.len() > 1 {
+                        found = Some(list);
+                    }
+                }
+            }
+        });
+        let Some(list) = found else { return };
+        let file = list[0].span.file;
+        let text = self.a.db.text(file);
+        // Entries from a macro expansion share the invocation's span.
+        if list.iter().any(|a| a.span.file != file)
+            || list.windows(2).any(|w| w[0].span.end > w[1].span.start)
+        {
+            return;
+        }
+        let gaps: Vec<&str> = list
+            .windows(2)
+            .map(|w| &text[w[0].span.end as usize..w[1].span.start as usize])
+            .collect();
+        if gaps.iter().any(|g| g.trim() != ";" && !g.trim().is_empty()) {
+            return;
+        }
+        let name = |a: &ActionRef| self.a.db.slice(a.name.span).to_string();
+        let region =
+            Span::new(file, list[0].span.start, list[list.len() - 1].span.end);
+        let rebuild = |entries: Vec<&ActionRef>| {
+            let mut s = String::new();
+            for (i, a) in entries.iter().enumerate() {
+                if i > 0 {
+                    s.push_str(gaps[i - 1]);
+                }
+                s.push_str(self.a.db.slice(a.span));
+            }
+            s
+        };
+        let mut unique: Vec<&ActionRef> = Vec::new();
+        for a in list {
+            if !unique.iter().any(|u| name(u) == name(a)) {
+                unique.push(a);
+            }
+        }
+        if unique.len() < list.len() {
+            out.push(CodeAction {
+                title: "Remove duplicate actions".into(),
+                kind: CodeActionKind::Rewrite,
+                edits: vec![(region, rebuild(unique))],
+                fixes: None,
+                preferred: false,
+            });
+        }
+        let key = |a: &&ActionRef| name(a).to_lowercase();
+        let mut sorted: Vec<&ActionRef> = list.iter().collect();
+        sorted.sort_by_key(key);
+        if sorted.iter().zip(list).any(|(a, b)| a.span != b.span) {
+            out.push(CodeAction {
+                title: "Sort actions".into(),
+                kind: CodeActionKind::Rewrite,
+                edits: vec![(region, rebuild(sorted))],
+                fixes: None,
+                preferred: false,
+            });
+        }
+    }
+
     /// Replace a macro invocation with its expansion.
     fn inline_macro(&self, out: &mut Vec<CodeAction>) {
         for &(use_span, m) in &self.a.pp.macro_uses {
@@ -812,6 +1111,17 @@ fn distance(a: &str, b: &str) -> usize {
 
 // -----------------------------------------------------------------------
 // AST traversal
+
+/// Every table declaration, including those in controls.
+fn walk_tables<'a>(decls: &'a [Decl], f: &mut dyn FnMut(&'a TableDecl)) {
+    for d in decls {
+        match d {
+            Decl::Table(t) => f(t),
+            Decl::Control(c) => walk_tables(&c.locals, f),
+            _ => {}
+        }
+    }
+}
 
 fn each_stmt<'a>(decls: &'a [Decl], f: &mut dyn FnMut(&'a Stmt)) {
     walk_decls(decls, f, &mut |_| {});

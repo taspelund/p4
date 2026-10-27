@@ -260,6 +260,11 @@ it, or the one trailing it on the same line). In addition:
 ### Completion and signature help
 
 - Members after `.`, and names in scope, with keywords and macros.
+- Only what fits where the cursor is: states after `transition` and in
+  `select` cases; match kinds after `:` in a table's `key`; actions not yet
+  listed in `actions`; actions after `default_action =` (those the table
+  lists first); and table properties not yet present (`key`, `actions`,
+  `default_action`, `size`, `entries`, ...) in a table body.
 - Auto-import: names declared in headers the program does not include yet
   are offered too, and accepting one adds the `#include`. Headers in the
   directories the program already includes from come first, so a Tofino
@@ -284,13 +289,20 @@ it), and labels after the closing `}` of long declarations and after
 - Quick fixes: change a misspelled name, member, state, or match kind to a
   similar one in scope; create a missing action (parameters guessed from
   the call) or parser state; add the `#include` for a header that declares
-  an unknown name; cast a value to the expected width; insert a missing
-  `;`; add an action to a table's `actions`; remove an unused declaration.
+  an unknown name; add an unknown member as a field of the program's
+  struct or header (typed after the other side of the assignment or
+  comparison; not offered for architecture headers); cast a value to the
+  expected width; insert a missing `;`; add an action to a table's
+  `actions`; remove an unused declaration.
 - Generate: the missing cases of a `switch (t.apply().action_run)`; `emit`
   calls in a deparser for each header field; parser states for headers
   that are never extracted.
 - Rewrite: replace an integer literal with an existing constant of the
-  same value; inline a macro use.
+  same value; inline a macro use; sort a table's `actions` list or remove
+  duplicate entries.
+- Extract: move an integer literal into a new constant (named after what
+  it is compared with or assigned to, such as `ETHER_TYPE_0800`; rename it
+  with `space r`).
 
 ## Command-line checks
 

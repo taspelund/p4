@@ -458,6 +458,9 @@ impl Server<'_> {
                 analysis::CodeActionKind::Rewrite => {
                     CodeActionKind::REFACTOR_REWRITE
                 }
+                analysis::CodeActionKind::Extract => {
+                    CodeActionKind::REFACTOR_EXTRACT
+                }
                 analysis::CodeActionKind::Inline => {
                     CodeActionKind::REFACTOR_INLINE
                 }

@@ -96,14 +96,21 @@ impl HeaderIndex {
     /// directories (where the program's existing includes live) come first,
     /// so a Tofino program gets Tofino headers.
     pub fn lookup_near(&self, name: &str, near: &[PathBuf]) -> Vec<Candidate> {
-        let mut all = self.by_name.get(name).cloned().unwrap_or_default();
-        all.sort_by_key(|c| {
-            !c.header
+        let Some(all) = self.by_name.get(name) else {
+            return Vec::new();
+        };
+        let is_near = |c: &&Candidate| {
+            c.header
                 .parent()
                 .is_some_and(|d| near.iter().any(|n| n == d))
-        });
-        all.truncate(MAX_CANDIDATES);
-        all
+        };
+        // Near candidates first, each group in its ranked order.
+        all.iter()
+            .filter(is_near)
+            .chain(all.iter().filter(|c| !is_near(c)))
+            .take(MAX_CANDIDATES)
+            .cloned()
+            .collect()
     }
 
     /// Names starting with `prefix` (case-insensitively), with their best

@@ -469,6 +469,82 @@ control c(inout headers_t hdr) {
 }
 
 #[test]
+fn completion_offers_only_what_fits_the_context() {
+    let f = fixture(&[(
+        "main.p4",
+        "header h_t { bit<8> x; }
+struct hs_t { h_t h; }
+parser p(packet_in pkt, out hs_t hdr) {
+    state start {
+        pkt.extract(hdr.h);
+        transition select (hdr.h.x) { 1: parse_b$0; default: $1 }
+    }
+    state parse_b { transition $2 }
+}
+control c(inout hs_t hdr) {
+    action a() { }
+    action b() { }
+    table t {
+        key = { hdr.h.x: e$3; }
+        actions = { a; $4 }
+        $5
+        default_action = $8
+    }
+    table u {
+        const $6
+    }
+    apply { t.apply(); u.apply(); $7 }
+}
+",
+    )]);
+    let labels = |m: &str| {
+        let (file, off) = f.at(m);
+        let mut l: Vec<_> =
+            f.a.completions(file, off)
+                .into_iter()
+                .map(|c| c.label)
+                .collect();
+        l.sort();
+        l
+    };
+    let states = ["accept", "parse_b", "reject", "start"];
+    assert_eq!(labels("0"), states);
+    assert_eq!(labels("1"), states);
+    assert_eq!(
+        labels("2"),
+        ["accept", "parse_b", "reject", "select", "start"]
+    );
+    // x4c's implicit `range` resolves because the program declares none.
+    assert_eq!(labels("3"), ["exact", "lpm", "range", "ternary"]);
+    // `a` is already listed.
+    assert_eq!(labels("4"), ["NoAction", "b"]);
+    // `key`, `actions`, and `default_action` are already present.
+    let props = labels("5");
+    assert!(
+        props.contains(&"size".to_string())
+            && !props.contains(&"key".to_string())
+            && !props.contains(&"actions".to_string())
+            && !props.contains(&"default_action".to_string()),
+        "{props:?}"
+    );
+    assert_eq!(labels("6"), ["default_action", "entries"]);
+    // Actions only, the listed one first, completing as calls.
+    let (file, off) = f.at("8");
+    let items = f.a.completions(file, off);
+    let mut labels8: Vec<_> = items.iter().map(|c| c.label.as_str()).collect();
+    assert_eq!(labels8[0], "a");
+    assert_eq!(items[0].insert.as_deref(), Some("a()$0"));
+    labels8.sort();
+    assert_eq!(labels8, ["NoAction", "a", "b"]);
+    // Elsewhere, everything in scope.
+    let any = labels("7");
+    assert!(
+        any.contains(&"hdr".to_string()) && any.contains(&"if".to_string()),
+        "{any:?}"
+    );
+}
+
+#[test]
 fn signature_help_tracks_nesting_and_overloads() {
     let f = fixture(&[(
         "main.p4",
@@ -619,7 +695,10 @@ parser p(packet_in pkt) {
     ]);
     assert_eq!(f.actions("0"), ["Change to `exact`"]);
     assert_eq!(f.actions("1")[0], "Change to `fwd_port`");
-    assert_eq!(f.actions("3"), ["Change to `ttl`"]);
+    assert_eq!(
+        f.actions("3"),
+        ["Change to `ttl`", "Add field `bit<8> tl` to `ipv4_h`"]
+    );
     // Parameter types come from the arguments; duplicate names are made
     // unique.
     let created = f.apply("2", "Create action `set_nexthop`", "main.p4");
@@ -795,14 +874,76 @@ control c(inout bit<16> t) {
 ",
     )]);
     // The 8-bit constant has the same value but not the literal's width.
-    assert_eq!(f.actions("0"), ["Replace with `ETHERTYPE_IPV4`"]);
+    assert_eq!(
+        f.actions("0"),
+        ["Replace with `ETHERTYPE_IPV4`", "Extract constant `T_0800`"]
+    );
     // An unsized literal matches any width.
     assert_eq!(
         f.actions("1"),
-        ["Replace with `ETHERTYPE_IPV4`", "Replace with `SMALL`"]
+        [
+            "Replace with `ETHERTYPE_IPV4`",
+            "Replace with `SMALL`",
+            "Extract constant `T_0800`"
+        ]
     );
     let fixed = f.apply("2", "Inline macro `TWICE`", "main.p4");
     assert!(fixed.contains("t = ((t) + (t));"), "{fixed}");
+}
+
+#[test]
+fn add_field_extract_constant_and_sort_actions() {
+    let f = fixture(&[(
+        "main.p4",
+        "header h_t {
+    bit<8> x;
+    bit<16> y;
+}
+struct meta_t { bit<8> m; }
+struct hs_t { h_t h; }
+control c(inout hs_t hdr, inout meta_t meta) {
+    action a() { }
+    action b() { }
+    table t {
+        key = { hdr.h.x: exact; }
+        actions = { b$3; a; @defaultonly NoAction; a; }
+    }
+    table u {
+        actions = { b$4; // the fallback
+            a; }
+    }
+    apply {
+        hdr.h.z$0 = hdr.h.y;
+        if (meta.flag$1 == true) { }
+        if (hdr.h.y == 0x08$200) { }
+    }
+}
+",
+    )]);
+    // Typed after the other side of the assignment or comparison.
+    assert!(f
+        .apply("0", "Add field `bit<16> z` to `h_t`", "main.p4")
+        .starts_with(
+            "header h_t {\n    bit<8> x;\n    bit<16> y;\n    bit<16> z;\n}\n"
+        ));
+    assert!(f
+        .apply("1", "Add field `bool flag` to `meta_t`", "main.p4")
+        .contains("struct meta_t { bit<8> m; \n    bool flag;\n}\n"));
+    let extracted = f.apply("2", "Extract constant `Y_0800`", "main.p4");
+    assert!(
+        extracted.contains(
+            "const bit<16> Y_0800 = 0x0800;\n\ncontrol c(inout hs_t hdr"
+        ) && extracted.contains("if (hdr.h.y == Y_0800) { }"),
+        "{extracted}"
+    );
+    assert!(f
+        .apply("3", "Remove duplicate actions", "main.p4")
+        .contains("actions = { b; a; @defaultonly NoAction; }"));
+    assert!(f
+        .apply("3", "Sort actions", "main.p4")
+        .contains("actions = { a; a; b; @defaultonly NoAction; }"));
+    // A comment between entries would end up beside the wrong action.
+    assert!(!f.actions("4").iter().any(|a| a == "Sort actions"));
 }
 
 #[test]
@@ -1387,5 +1528,87 @@ control c(inout s_t s, packet_out o) {
             "main.p4:37:s.a.x: `emit` expects a header, header union, struct, \
              or header stack, found `bit<8>`",
         ]
+    );
+}
+
+#[test]
+fn parser_states_without_transition_and_repeated_table_applies() {
+    let f = fixture(&[(
+        "main.p4",
+        "#include \"core.p4\"
+header h_t { bit<8> x; }
+parser p(packet_in pkt, out h_t h) {
+    state start {
+        pkt.extract(h);
+        transition select(h.x) { 1: parse_x; 2: nested; default: accept; }
+    }
+    state parse_x {
+        pkt.extract(h);
+    }
+    state empty { }
+    state nested {
+        if (h.x == 1) { transition accept; } else { transition reject; }
+    }
+}
+control c(inout h_t h) {
+    table t { actions = { NoAction; } }
+    table u { actions = { NoAction; } }
+    apply {
+        t.apply();
+        t.apply();
+        if (u.apply().hit) { u.apply(); } else { u.apply(); }
+        switch (t.apply().action_run) {
+            NoAction: { t.apply(); }
+        }
+    }
+}
+",
+    )]);
+    // p4c's front end accepts tables applied more than once on one path
+    // (p4_16_samples/issue2344.p4, apply-cf.p4, exit4.p4); only some back
+    // ends reject them.
+    assert!(f.errors().is_empty(), "{:?}", f.errors());
+    let warnings: Vec<String> =
+        f.a.diagnostics()
+            .iter()
+            .filter(|d| d.severity == x4c_lsp::diag::Severity::Warning)
+            .map(|d| format!("{}: {}", f.show(d.span), d.message))
+            .collect();
+    assert_eq!(
+        warnings,
+        [
+            "main.p4:8:parse_x: state `parse_x` has no `transition` and \
+             always rejects",
+            "main.p4:11:empty: state `empty` has no `transition` and always \
+             rejects",
+        ]
+    );
+    // A state cut short by a parse error is still being written.
+    let f = fixture(&[(
+        "main.p4",
+        "#include \"core.p4\"
+header h_t { bit<8> x; }
+parser p(packet_in pkt, out h_t h) {
+    state start {
+        pkt.extract(h);
+        transition parse_x;
+    }
+    state parse_x {
+        pkt.extract(h);
+        h.
+    }
+    state assign {
+        h.x = ;
+    }
+    state unclosed {
+        pkt.extract(h);
+",
+    )]);
+    assert!(
+        !f.a.diagnostics()
+            .iter()
+            .any(|d| d.code == Some("parser-transition")),
+        "{:?}",
+        f.a.diagnostics()
     );
 }

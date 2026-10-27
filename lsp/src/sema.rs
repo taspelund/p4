@@ -455,6 +455,7 @@ pub fn analyze(
         quiet: false,
         action_table: None,
         parser: None,
+        incomplete: 0,
     };
     r.s.scopes.push(Scope {
         parent: None,
@@ -488,6 +489,9 @@ struct Resolver<'a> {
     action_table: Option<(Span, Vec<(String, String)>)>,
     /// The parser being walked.
     parser: Option<DefId>,
+    /// Parse-error placeholders walked so far, so checks can skip code
+    /// that is still being written.
+    incomplete: usize,
 }
 
 impl Resolver<'_> {
@@ -1488,6 +1492,7 @@ impl Resolver<'_> {
     }
 
     fn state(&mut self, s: &ParserState) {
+        let incomplete = self.incomplete;
         self.with_scope(Some(s.span), |r| {
             for st in &s.body {
                 r.stmt(st);
@@ -1496,6 +1501,52 @@ impl Resolver<'_> {
                 r.transition(t);
             }
         });
+        if s.transition.is_none() && self.incomplete == incomplete {
+            self.check_no_transition(s);
+        }
+    }
+
+    /// Warn about a state without a final `transition`, which implicitly
+    /// transitions to `reject` (p4c's `parser-transition` warning). The
+    /// caller skips states with parse errors in their body; unclosed or
+    /// macro-generated states and those with a nested x4c `transition` are
+    /// skipped here.
+    fn check_no_transition(&mut self, s: &ParserState) {
+        fn nested(s: &Stmt) -> bool {
+            match &s.kind {
+                StmtKind::Transition(_) => true,
+                StmtKind::If { then, els, .. } => {
+                    nested(then) || els.as_deref().is_some_and(nested)
+                }
+                StmtKind::Block(b) => b.stmts.iter().any(nested),
+                StmtKind::Switch { cases, .. } => cases
+                    .iter()
+                    .filter_map(|c| c.body.as_ref())
+                    .any(|b| b.stmts.iter().any(nested)),
+                StmtKind::For { body, .. } | StmtKind::ForIn { body, .. } => {
+                    nested(body)
+                }
+                _ => false,
+            }
+        }
+        let name = &s.name;
+        if name.is_missing()
+            || matches!(name.text.as_str(), "accept" | "reject")
+            || !self.db.slice(s.span).ends_with('}')
+            || s.body.iter().any(nested)
+        {
+            return;
+        }
+        self.report(
+            Diagnostic::warning(
+                name.span,
+                format!(
+                    "state `{}` has no `transition` and always rejects",
+                    name.text
+                ),
+            )
+            .with_code("parser-transition"),
+        );
     }
 
     fn transition(&mut self, t: &Transition) {
@@ -1861,7 +1912,11 @@ impl Resolver<'_> {
                     _ => self.check_assign(&target, &value, rhs),
                 }
             }
-            StmtKind::Call(e) | StmtKind::Expr(e) => {
+            StmtKind::Call(e) => {
+                self.expr(e);
+            }
+            StmtKind::Expr(e) => {
+                self.incomplete += 1;
                 self.expr(e);
             }
             StmtKind::If { cond, then, els } => {
@@ -1922,11 +1977,11 @@ impl Resolver<'_> {
                 });
             }
             StmtKind::Transition(t) => self.transition(t),
+            StmtKind::Error => self.incomplete += 1,
             StmtKind::Exit
             | StmtKind::Break
             | StmtKind::Continue
-            | StmtKind::Empty
-            | StmtKind::Error => {}
+            | StmtKind::Empty => {}
         }
     }
 
@@ -2560,7 +2615,11 @@ impl Resolver<'_> {
             TypeKind::String => Ty::String,
             TypeKind::Void | TypeKind::MatchKind => Ty::Base,
             TypeKind::ErrorType => Ty::Error,
-            TypeKind::DontCare | TypeKind::Error => Ty::Unknown,
+            TypeKind::DontCare => Ty::Unknown,
+            TypeKind::Error => {
+                self.incomplete += 1;
+                Ty::Unknown
+            }
             TypeKind::Named { path, args } => {
                 let defs = self.path(path, Want::Type);
                 let args: Vec<Ty> =
@@ -2662,6 +2721,7 @@ impl Resolver<'_> {
                     base: base_ty.clone(),
                 });
                 if member.is_missing() {
+                    self.incomplete += 1;
                     return (Ty::Unknown, Vec::new());
                 }
                 let candidates: Vec<(DefId, Ty)> = self
@@ -2875,11 +2935,14 @@ impl Resolver<'_> {
                 }
                 (Ty::Unknown, Vec::new())
             }
+            ExprKind::Error => {
+                self.incomplete += 1;
+                (Ty::Unknown, Vec::new())
+            }
             ExprKind::Invalid
             | ExprKind::Dots
             | ExprKind::This
-            | ExprKind::DontCare
-            | ExprKind::Error => (Ty::Unknown, Vec::new()),
+            | ExprKind::DontCare => (Ty::Unknown, Vec::new()),
         }
     }
 

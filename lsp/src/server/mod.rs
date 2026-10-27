@@ -228,6 +228,7 @@ impl<'a> Server<'a> {
                         CodeActionKind::REFACTOR,
                         CodeActionKind::REFACTOR_REWRITE,
                         CodeActionKind::REFACTOR_INLINE,
+                        CodeActionKind::REFACTOR_EXTRACT,
                     ]),
                     resolve_provider: Some(false),
                     work_done_progress_options: Default::default(),

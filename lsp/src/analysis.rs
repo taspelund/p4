@@ -174,6 +174,8 @@ pub enum CodeActionKind {
     Rewrite,
     /// Inlines a definition, such as a macro.
     Inline,
+    /// Extracts code into a new declaration, such as a constant.
+    Extract,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -232,6 +234,68 @@ enum Target {
     Macro(usize),
     Include(usize),
 }
+
+/// Where completion was requested; see [`Analysis::completion_context`].
+enum Context {
+    /// Anywhere else: everything in scope, keywords, and snippets.
+    Any,
+    /// A state name after `transition` (`select` too) or in a `select` case.
+    State { select: bool },
+    /// After `:` in a table's `key`.
+    MatchKind,
+    /// An entry of a table's `actions` list, with the names already listed.
+    TableActions(Vec<String>),
+    /// After `default_action =`, with the actions the table lists (offered
+    /// first).
+    DefaultAction(Vec<String>),
+    /// A property of a table body, with the properties already present.
+    TableProperty {
+        present: Vec<String>,
+        after_const: bool,
+    },
+}
+
+/// Table properties: name, detail, and snippet.
+const TABLE_PROPERTIES: &[(&str, &str, &str)] = &[
+    (
+        "key",
+        "key = { ... }",
+        "key = {\n\t${1:field}: ${2:exact};\n}",
+    ),
+    (
+        "actions",
+        "actions = { ... }",
+        "actions = {\n\t${1:NoAction};\n}",
+    ),
+    (
+        "default_action",
+        "default_action = action(...);",
+        "default_action = ${1:NoAction}();",
+    ),
+    ("size", "size = N;", "size = ${1:1024};"),
+    ("entries", "entries = { ... }", "entries = {\n\t$0\n}"),
+    (
+        "implementation",
+        "implementation = instance;",
+        "implementation = ${1:instance};",
+    ),
+    (
+        "counters",
+        "counters = instance;",
+        "counters = ${1:instance};",
+    ),
+    ("meters", "meters = instance;", "meters = ${1:instance};"),
+    (
+        "largest_priority_wins",
+        "largest_priority_wins = bool;",
+        "largest_priority_wins = ${1:true};",
+    ),
+    (
+        "priority_delta",
+        "priority_delta = N;",
+        "priority_delta = ${1:1};",
+    ),
+];
 
 const KEYWORDS: &[&str] = &[
     "abstract",
@@ -1317,6 +1381,10 @@ impl Analysis {
             self.add_call_snippets(file, offset, &mut items, &all);
             return items;
         }
+        match self.completion_context(file, offset) {
+            Context::Any => {}
+            ctx => return self.context_completions(file, offset, ctx),
+        }
         let mut seen = std::collections::HashSet::new();
         let visible = self.sema.visible_at(Span::new(file, offset, offset));
         let defs: Vec<DefId> = visible
@@ -1350,6 +1418,235 @@ impl Analysis {
         }
         out.extend(self.import_completions(file, offset, &seen));
         out
+    }
+
+    /// Where the cursor is, for completion that offers only what fits
+    /// there. Works on the file's raw tokens, so it does not depend on the
+    /// (possibly broken) code around the cursor parsing.
+    fn completion_context(&self, file: FileId, offset: u32) -> Context {
+        use crate::lexer::TokenKind as K;
+        let text = self.db.text(file);
+        let end = text.floor_char_boundary(offset as usize);
+        let word = text[..end]
+            .trim_end_matches(|c: char| c.is_ascii_alphanumeric() || c == '_')
+            .len() as u32;
+        let toks = crate::lexer::lex(file, text).tokens;
+        let n = toks.partition_point(|t| t.span.start < word);
+        // The token being completed, if a word has been typed.
+        let current = ((word as usize) < end).then_some(n);
+        let kind = |i: usize| toks[i].kind;
+        let word_is =
+            |i: usize, w: &str| toks[i].kind == K::Ident && toks[i].text == w;
+        let Some(prev) = n.checked_sub(1) else {
+            return Context::Any;
+        };
+        if word_is(prev, "transition") {
+            return Context::State { select: true };
+        }
+        // The innermost unclosed `{` before the cursor.
+        let mut depth = 0u32;
+        let mut open = None;
+        for i in (0..n).rev() {
+            match kind(i) {
+                K::RBrace => depth += 1,
+                K::LBrace if depth == 0 => {
+                    open = Some(i);
+                    break;
+                }
+                K::LBrace => depth -= 1,
+                _ => {}
+            }
+        }
+        let Some(open) = open else {
+            return Context::Any;
+        };
+        // Identifiers at the top level of the braces, other than the word
+        // being completed, and whether each is followed by `=`.
+        let names = || {
+            let mut out = Vec::new();
+            let mut depth = 0u32;
+            for i in open + 1..toks.len() {
+                match kind(i) {
+                    K::LBrace | K::LParen => depth += 1,
+                    K::RBrace | K::RParen if depth == 0 => break,
+                    K::RBrace | K::RParen => depth -= 1,
+                    K::Ident if depth == 0 && Some(i) != current => {
+                        let eq =
+                            toks.get(i + 1).is_some_and(|t| t.kind == K::Eq);
+                        out.push((toks[i].text.clone(), eq));
+                    }
+                    _ => {}
+                }
+            }
+            out
+        };
+        let item_start = matches!(kind(prev), K::LBrace | K::Semi | K::RBrace);
+        if open >= 2 && kind(open - 1) == K::Eq {
+            if word_is(open - 2, "key") && kind(prev) == K::Colon {
+                return Context::MatchKind;
+            }
+            if word_is(open - 2, "actions") && item_start {
+                return Context::TableActions(
+                    names().into_iter().map(|(n, _)| n).collect(),
+                );
+            }
+        }
+        if open >= 2 && kind(open - 1) == K::Ident && word_is(open - 2, "table")
+        {
+            if kind(prev) == K::Eq
+                && prev >= 1
+                && word_is(prev - 1, "default_action")
+            {
+                // The actions listed in the table, wherever the list is.
+                let mut listed = Vec::new();
+                let mut depth = 0u32;
+                let mut i = open + 1;
+                while i < toks.len() {
+                    match kind(i) {
+                        K::LBrace
+                            if depth == 0
+                                && i >= 2
+                                && kind(i - 1) == K::Eq
+                                && word_is(i - 2, "actions") =>
+                        {
+                            i += 1;
+                            while i < toks.len() && kind(i) != K::RBrace {
+                                if kind(i) == K::Ident {
+                                    listed.push(toks[i].text.clone());
+                                }
+                                i += 1;
+                            }
+                        }
+                        K::LBrace => depth += 1,
+                        K::RBrace if depth == 0 => break,
+                        K::RBrace => depth -= 1,
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                return Context::DefaultAction(listed);
+            }
+            let after_const = word_is(prev, "const");
+            if item_start || after_const {
+                let present = names()
+                    .into_iter()
+                    .filter(|&(_, eq)| eq)
+                    .map(|(n, _)| n)
+                    .collect();
+                return Context::TableProperty {
+                    present,
+                    after_const,
+                };
+            }
+        }
+        // `select (...) { ...: <cursor>`
+        if open >= 1 && kind(open - 1) == K::RParen && kind(prev) == K::Colon {
+            let mut depth = 0u32;
+            for i in (0..open - 1).rev() {
+                match kind(i) {
+                    K::RParen => depth += 1,
+                    K::LParen if depth == 0 => {
+                        if i >= 1 && word_is(i - 1, "select") {
+                            return Context::State { select: false };
+                        }
+                        break;
+                    }
+                    K::LParen => depth -= 1,
+                    _ => {}
+                }
+            }
+        }
+        Context::Any
+    }
+
+    /// Completions for a [`Context`] other than [`Context::Any`].
+    fn context_completions(
+        &self,
+        file: FileId,
+        offset: u32,
+        ctx: Context,
+    ) -> Vec<Completion> {
+        let mut defs = self.sema.visible_at(Span::new(file, offset, offset));
+        defs.extend(self.sema.implicit_names());
+        let mut seen = std::collections::HashSet::new();
+        let mut of_kind =
+            |kind: SymbolKind, skip: &[String]| -> Vec<Completion> {
+                defs.iter()
+                    .filter(|&&d| {
+                        let def = self.sema.def(d);
+                        def.kind == kind
+                            && !skip.contains(&def.name)
+                            && seen.insert(def.name.clone())
+                    })
+                    .map(|&d| self.completion_for(d))
+                    .collect()
+            };
+        match ctx {
+            Context::Any => Vec::new(),
+            Context::MatchKind => of_kind(SymbolKind::MatchKind, &[]),
+            Context::TableActions(listed) => {
+                of_kind(SymbolKind::Action, &listed)
+            }
+            Context::DefaultAction(listed) => {
+                let mut actions: Vec<DefId> = defs
+                    .iter()
+                    .copied()
+                    .filter(|&d| {
+                        let def = self.sema.def(d);
+                        def.kind == SymbolKind::Action
+                            && seen.insert(def.name.clone())
+                    })
+                    .collect();
+                // Listed actions first; the others may be on their way into
+                // the list (or get the quick fix that adds them).
+                actions
+                    .sort_by_key(|&d| !listed.contains(&self.sema.def(d).name));
+                let mut out: Vec<Completion> =
+                    actions.iter().map(|&d| self.completion_for(d)).collect();
+                self.add_call_snippets(file, offset, &mut out, &actions);
+                out
+            }
+            Context::State { select } => {
+                let mut out = of_kind(SymbolKind::State, &[]);
+                for name in ["accept", "reject"] {
+                    if seen.insert(name.to_string()) {
+                        out.push(Completion {
+                            detail: Some(format!("state {name}")),
+                            ..Completion::new(name, SymbolKind::State)
+                        });
+                    }
+                }
+                if select {
+                    out.push(Completion {
+                        detail: Some("transition select (...) { ... }".into()),
+                        insert: Some(
+                            "select (${1:key}) {\n\t${2:value}: ${3:state};\n\tdefault: ${4:accept};\n}"
+                                .into(),
+                        ),
+                        snippet: true,
+                        ..Completion::new("select", SymbolKind::Keyword)
+                    });
+                }
+                out
+            }
+            Context::TableProperty {
+                present,
+                after_const,
+            } => TABLE_PROPERTIES
+                .iter()
+                .filter(|(name, _, _)| !present.iter().any(|p| p == name))
+                .filter(|(name, _, _)| {
+                    !after_const
+                        || matches!(*name, "entries" | "default_action")
+                })
+                .map(|&(name, detail, body)| Completion {
+                    detail: Some(detail.into()),
+                    insert: Some(body.into()),
+                    snippet: true,
+                    ..Completion::new(name, SymbolKind::Keyword)
+                })
+                .collect(),
+        }
     }
 
     /// Directories holding the files the program includes, used to prefer
